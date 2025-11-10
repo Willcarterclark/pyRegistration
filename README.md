@@ -6,7 +6,7 @@ Deformable Image Registration for medical images
     "DataFolder" / "PatientNumber" / "Visit" / "Image" & "Masks" / *.nii.gz or *.mha
     *Should* work with any image types, provided the masks and images are consistent filetypes.
 
-# Outputs registrations to folder: "Reg_{moving image name}_2_{fixed image name}" in Patient folder
+Outputs registrations to folder: "Reg_{moving image name}_2_{fixed image name}" in Patient folder
 		"DataFolder" / "PatientNumber" / "Visit" / Reg_X_2_Y / *.nii.gz
 
 Images are outputted as ".nii.gz" image types! - if there is enough demand to move to another image type I'll implement a way of specifiying the output file type. 
