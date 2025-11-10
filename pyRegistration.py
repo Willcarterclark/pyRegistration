@@ -101,7 +101,7 @@ print(f"Registration Mask Expansion: {reg_expand_mask}")
 
 #%% Manual input (for testing - commented out by default)
 
-# path_patient_dir = r"X:\\polaris2\\shared\\will\\MMAVIC\\MMAVIC_2\\MMAVIC03" 
+# path_patient_dir = r"X:\\shared" 
 # scan_folder =  "img"
 # seg_folder = "seg"
 # img_fix = "_RV"
