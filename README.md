@@ -1,5 +1,5 @@
 # pyRegistration
-Deformable Image Registration for medical images
+Deformable Image Registration for medical images using ANTs. Designed to support nested-patient folder structures. 
 
 # Pre-requisites:
 Need nested structure of patient image folders:
