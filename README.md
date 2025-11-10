@@ -13,7 +13,7 @@ Outputs registrations to folder: "Reg_{moving image name}_2_{fixed image name}" 
 
 		"DataFolder" / "PatientNumber" / "Visit" / Reg_X_2_Y / *.nii.gz
 
-Images are outputted as ".nii.gz" image types! - if there is enough demand to move to another image type I'll implement a way of specifiying the output file type. 
+Supported output image types are .nii.gz (defualt), .nii, .mha .
 
 # Scripts:
 
