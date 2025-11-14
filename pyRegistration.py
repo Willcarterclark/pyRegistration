@@ -2,7 +2,13 @@
 """
 Created on Wed Jun  4 11:26:59 2025
 
-@author: Will Clark
+@author: will Clark
+
+FIXED VERSION:
+- Registration uses EXPANDED masks
+- Transform application uses ORIGINAL (non-masked) images
+- Output masking uses ORIGINAL (non-expanded) masks
+- Added file type specification for outputs
 """
 #%%Packages
 
@@ -16,6 +22,8 @@ import glob
 import ants
 import subprocess
 import shlex
+import csv
+import ast
 
 from pathlib import Path
 from typing import Optional, Tuple
@@ -29,7 +37,7 @@ import sys
 """
 PYTHON NESTED DIRECTORY REGISTRATION SCRIPT
 --
-by Will Clark - wclark2@sheffield.ac.uk willcarterclark@gmail.com
+by Will Clark - wclark2@sheffield.ac.uk
 POLARIS - University of Sheffield
 --
 Running this script requires the paired BASH .sh script, although the script can be run manually
@@ -68,6 +76,10 @@ parser.add_argument('-dim','--dimensions', help="Registration Dimensions", type=
 parser.add_argument('-ants_reg_params', '--ants_registration_parameters', help="ANTs registration command parameters", type=str, required=True)
 parser.add_argument('-out_dir', '--output_directory', help="Optional output directory for registration results", type=Path)
 parser.add_argument('-reg_exp_mask', '--reg_expand_mask', help="Expand Registration Mask - use 0 for none, integer 1-10 for voxel size filter, default is 8", type=str)
+parser.add_argument('-out_type', '--output_filetype', help="Output file type (e.g., '.nii.gz', '.mha', '.nii'). Default is '.nii.gz'", type=str, default='.nii.gz')
+parser.add_argument('-saveinputs', '--save_input_copies', 
+                    help="Save copies of input images and masks to registration directory", 
+                    action='store_true', default=False)
 
 # Parse arguments
 args = parser.parse_args()
@@ -86,6 +98,12 @@ dimensions = str(args.dimensions) if args.dimensions else "3"
 ants_reg_params_str = str(args.ants_registration_parameters)
 output_directory = str(args.output_directory) if args.output_directory else None
 reg_expand_mask = int(args.reg_expand_mask) if args.reg_expand_mask else 8
+output_filetype = str(args.output_filetype) if args.output_filetype else '.nii.gz'
+save_input_copies = args.save_input_copies
+
+# Ensure output filetype starts with a dot
+if not output_filetype.startswith('.'):
+    output_filetype = '.' + output_filetype
 
 # Output the parsed paths and arguments for verification
 print(f"Patient Directory Path: {path_patient_dir}")
@@ -98,22 +116,7 @@ print(f"Registration Dimensions: {dimensions}")
 print(f"ANTs Registration Parameters String: {ants_reg_params_str}")
 print(f"Output Directory: {output_directory if output_directory else 'In-folder (default)'}")
 print(f"Registration Mask Expansion: {reg_expand_mask}")
-
-#%% Manual input (for testing - commented out by default)
-
-# path_patient_dir = r"X:\\shared" 
-# scan_folder =  "img"
-# seg_folder = "seg"
-# img_fix = "_RV"
-# img_fix_mask = None
-# img_mov = "_TLC"
-# img_mov_mask = None
-# sub_folder = None
-# output_directory = None
-# dimensions = "3"
-# reg_expand_mask = 8
-# ants_reg_params_str = "--dimensionality 3 --verbose 1 --output \"[{output_prefix_full_placeholder},{output_prefix_full_placeholder}_warped.nii.gz,{output_prefix_full_placeholder}_inv_warped.nii.gz]\" --use-histogram-matching 1 --initial-moving-transform \"[{fixed_placeholder},{moving_placeholder},1]\" --transform \"Rigid[0.1]\" --metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" --convergence \"1000x500x250x100\" --smoothing-sigmas \"3x2x1x0\" --shrink-factors \"8x4x2x1\" --transform \"Affine[0.1]\" --metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" --convergence \"1000x500x250x100\" --smoothing-sigmas \"3x2x1x0\" --shrink-factors \"8x4x2x1\" --transform \"BSplineSyN[0.2,65,0,3]\" --metric \"CC[{fixed_placeholder},{moving_placeholder},1,2]\" --convergence \"500x200x70x50x10\" --smoothing-sigmas \"5x3x2x1x0\" --shrink-factors \"10x6x4x2x1\""
-# path_ants = None
+print(f"Output File Type: {output_filetype}")
 
 #%% Load Directory functions
 
@@ -516,11 +519,28 @@ def calculate_registration_accuracy(fixed_img_path: str,
     
     return metrics
 
+#save cmd
+def format_command_string(cmd_string):
+    """
+    Convert Python list string to command format for .txt files.
+    
+    Removes outer brackets, single quotes, and commas between parameters.
+    Preserves commas inside parameter brackets like MI[a,b,c,d].
+    
+    Args:
+        cmd_string (str): String representation of command list
+    
+    Returns:
+        str: Formatted command string
+    """
+    cmd_list = ast.literal_eval(cmd_string.strip())
+    return ' '.join(cmd_list)
+
 #%% Prepare Registration
 
 def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8, 
              ants_reg_params_str=None, output_base_dir=None, Fixed_mask=None, 
-             Moving_mask=None, dimensions="3"):
+             Moving_mask=None, dimensions="3", output_filetype='.nii.gz'):
     
     
     global fix_img_path
@@ -536,12 +556,13 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
         Fixed_img: Fixed image identifier
         Moving_img: Moving image identifier
         Input_segs: Optional DataFrame with segmentations
-        reg_mask: Radius for mask expansion
+        reg_mask: Radius for mask expansion (for registration constraint only)
         ants_reg_params_str: ANTs registration parameters
         output_base_dir: Optional output directory
         Fixed_mask: Optional fixed mask identifier
         Moving_mask: Optional moving mask identifier
         dimensions: Registration dimensions (default "3")
+        output_filetype: Output file extension (default '.nii.gz')
     """
     print("--")
     print("Preparing registrations...")
@@ -613,7 +634,7 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
             print("ERROR: Please check segmentation filenames or if segmentation files exist.")
             continue
         
-        # Load the image paths
+        # Load the image paths (ORIGINAL, NON-MASKED images)
         fix_img_path = os.path.join(img_dir, fix_img)
         mov_img_path = os.path.join(img_dir, mov_img)
         
@@ -633,46 +654,33 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
         if mov_seg_path:
             print(f"Moving Seg Path: {mov_seg_path}")
         
-        # Load images using sitk
+        # Load images and masks using sitk
         fix_img_sitk = load_sitk(fix_img_path)
         mov_img_sitk = load_sitk(mov_img_path)
         
-        masked_dir = None
+        # Load original masks (non-expanded) if available
+        fix_seg_sitk_original = None
+        mov_seg_sitk_original = None
+        fix_seg_sitk_expanded = None
+        mov_seg_sitk_expanded = None
+        
         if has_segs and fix_seg_path and mov_seg_path:
-            fix_seg_sitk = load_sitk(fix_seg_path)
-            mov_seg_sitk = load_sitk(mov_seg_path)
+            fix_seg_sitk_original = load_sitk(fix_seg_path)
+            mov_seg_sitk_original = load_sitk(mov_seg_path)
             
-            # Apply masks and save to folder
-            masked_dir = str.replace(img_dir, scan_folder, "masked")
-            os.makedirs(masked_dir, exist_ok=True)
+            # Create expanded masks for registration constraint
+            if reg_mask > 0:
+                print(f"Creating expanded registration masks (radius={reg_mask} voxels)...")
+                fix_seg_sitk_expanded = expand_mask_radially(mask_image=fix_seg_sitk_original, radius=reg_mask)
+                mov_seg_sitk_expanded = expand_mask_radially(mask_image=mov_seg_sitk_original, radius=reg_mask)
+                print("Expanded masks created for registration constraint")
+            else:
+                print("No mask expansion (reg_mask=0)")
+                fix_seg_sitk_expanded = fix_seg_sitk_original
+                mov_seg_sitk_expanded = mov_seg_sitk_original
         
         print("Images loaded!")
         print("--")
-        
-        # Use expanded "registration" mask if available
-        if reg_mask and has_segs and fix_seg_path and mov_seg_path:
-            print(f"Expanding registration masks by {reg_mask} voxels")
-            mov_seg_sitk = expand_mask_radially(mask_image=mov_seg_sitk, radius=reg_mask)
-            fix_seg_sitk = expand_mask_radially(mask_image=fix_seg_sitk, radius=reg_mask)
-            print("Using expanded registration masks...")
-        
-        # Create masked images if segmentations are available
-        if has_segs and fix_seg_path and mov_seg_path:
-            fix_masked = apply_mask(fix_img_sitk, fix_seg_sitk)
-            mov_masked = apply_mask(mov_img_sitk, mov_seg_sitk)
-            
-            fix_masked_string = str.replace(fix_img, "_image", "_masked")
-            mov_masked_string = str.replace(mov_img, "_image", "_masked")
-            
-            fix_masked_path = os.path.join(masked_dir, fix_masked_string)
-            mov_masked_path = os.path.join(masked_dir, mov_masked_string)
-            
-            save_sitk(fix_masked, fix_masked_path)
-            save_sitk(mov_masked, mov_masked_path)
-        else:
-            # No masks - use original images
-            fix_masked_path = fix_img_path
-            mov_masked_path = mov_img_path
         
         # Save Registration Dir
         reg_str = f"Reg_{Moving_img}_2_{Fixed_img}"
@@ -703,22 +711,67 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
         print("Creating Registration Directory...")
         os.makedirs(Reg_dir, exist_ok=True)
         
+        
+        fix_seg_expanded_path = None
+        mov_seg_expanded_path = None
+        # Save expanded masks for ANTs registration
+        if has_segs and fix_seg_sitk_expanded is not None and mov_seg_sitk_expanded is not None:
+            
+            #
+            fix_seg_expanded_path = os.path.join(Reg_dir, "_fixed_mask_expanded.nii.gz")
+            mov_seg_expanded_path = os.path.join(Reg_dir, "_moving_mask_expanded.nii.gz")
+            
+            save_sitk(fix_seg_sitk_expanded, fix_seg_expanded_path)
+            save_sitk(mov_seg_sitk_expanded, mov_seg_expanded_path)
+            print("Expanded masks saved for registration")
+        
+        #Save output images -saveinputs
+        
+        if save_input_copies:
+            print("Saving input copies to registration directory...")
+              
+            #Save fixed and moving image to registration folder
+            fix_img_path_tmp = os.path.join(Reg_dir, "_fixed_image.nii.gz")
+            mov_img_path_tmp = os.path.join(Reg_dir, "_moving_image.nii.gz")
+            
+            save_sitk(fix_img_sitk, fix_img_path_tmp)
+            save_sitk(mov_img_sitk, mov_img_path_tmp)
+            print("Moving and fixed image saved to ouput directory")
+            
+            #Save fixed and moving maks to registration folder
+            if fix_seg_sitk_original and mov_seg_sitk_original:
+                fix_seg_path_tmp = os.path.join(Reg_dir, "_fixed_mask.nii.gz")
+                mov_seg_path_tmp = os.path.join(Reg_dir, "_moving_mask.nii.gz")
+                
+                save_sitk(fix_seg_sitk_original, fix_seg_path_tmp)
+                save_sitk(mov_seg_sitk_original, mov_seg_path_tmp)
+                print("Moving and fixed masks saved to ouput directory")
+        
         # Run Registration
+        
+        #Run registration just using images and masks
+            
+        
+        print("Running Registration with unmasked images and expanded masks")
         success = run_reg(
-            fixed=fix_masked_path,
-            moving=mov_masked_path,
-            fixed_mask=fix_seg_path,
-            moving_mask=mov_seg_path,
+            fixed=fix_img_path,  # ORIGINAL image, not masked
+            moving=mov_img_path,  # ORIGINAL image, not masked
+            fixed_mask_original=fix_seg_path,  # Original mask for output
+            moving_mask_original=mov_seg_path,  # Original mask for output
+            fixed_mask_expanded=fix_seg_expanded_path,  # Expanded mask for registration
+            moving_mask_expanded=mov_seg_expanded_path,  # Expanded mask for registration
             output_dir=Reg_dir,
             output_prefix=reg_str + "_",
             ants_path=path_ants,
             ants_reg_params_template=ants_reg_params_str,
             use_masks=(has_segs and fix_seg_path is not None),
-            dimensions=dimensions
+            dimensions=dimensions,
+            output_filetype=output_filetype
         )
-        
+            
         if success:
             print("Iteration complete...")
+            
         else:
             print("Registration failed for this iteration")
         print("--")
@@ -727,11 +780,27 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
 
 #%% Run registration
 
-def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None, 
-            moving_mask=None, ants_path=None, use_masks=False, 
-            ants_reg_params_template=None, dimensions="3"):
+def run_reg(fixed, moving, output_dir, output_prefix, 
+            fixed_mask_original=None, moving_mask_original=None,
+            fixed_mask_expanded=None, moving_mask_expanded=None,
+            ants_path=None, use_masks=False, 
+            ants_reg_params_template=None, dimensions="3", output_filetype='.nii.gz'):
     """
     Perform image registration using ANTs with optional masking and output the transforms.
+    
+    MASK HANDLING:
+    - Registration uses EXPANDED masks (fixed_mask_expanded, moving_mask_expanded)
+    - Transform application uses ORIGINAL images (fixed, moving - not pre-masked)
+    - Output masking uses ORIGINAL masks (fixed_mask_original, moving_mask_original)
+    
+    Args:
+        fixed: Path to ORIGINAL fixed image (not pre-masked)
+        moving: Path to ORIGINAL moving image (not pre-masked)
+        fixed_mask_original: Path to original (non-expanded) fixed mask
+        moving_mask_original: Path to original (non-expanded) moving mask
+        fixed_mask_expanded: Path to expanded fixed mask (for registration constraint)
+        moving_mask_expanded: Path to expanded moving mask (for registration constraint)
+        output_filetype: Output file extension (e.g., '.nii.gz', '.mha')
     
     Returns:
         Tuple or False: Returns tuple of output files if successful, False if failed
@@ -745,6 +814,17 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
     warp_file = f"{output_prefix_full}1Warp.nii.gz"
     affine_file = f"{output_prefix_full}0GenericAffine.mat"
     inv_warp_file = f"{output_prefix_full}1InverseWarp.nii.gz"
+    ants_command = f"{output_prefix_full}0ANTsCall.txt"
+    
+    print("=" * 80)
+    print("REGISTRATION CONFIGURATION:")
+    print(f"  Using ORIGINAL images for transform application: {os.path.basename(fixed)}, {os.path.basename(moving)}")
+    if use_masks and fixed_mask_expanded:
+        print(f"  Using EXPANDED masks for registration constraint")
+    if use_masks and fixed_mask_original:
+        print(f"  Using ORIGINAL masks for output warping")
+    print(f"  Output file type: {output_filetype}")
+    print("=" * 80)
     
     print("Defining ANTs parameters and running registration...")
     
@@ -760,16 +840,27 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
     # Build registration command
     registration_command = [ants_registration] + shlex.split(formatted_ants_reg_params)
     
-    # Add the mask argument if provided
-    if fixed_mask and moving_mask and use_masks:
-        registration_command.extend(["--masks", f"[{fixed_mask},{moving_mask}]"])
-        print(f"Using masks: fixed - {fixed_mask}, moving - {moving_mask}")
-    elif fixed_mask and use_masks:
-        registration_command.extend(["--masks", f"[{fixed_mask}]"])
-        print(f"Using fixed mask: {fixed_mask}")
+    
+    # Add the EXPANDED mask argument if provided (for registration constraint)
+    if fixed_mask_expanded and moving_mask_expanded and use_masks:
+        registration_command.extend(["--masks", f"[{fixed_mask_expanded},{moving_mask_expanded}]"])
+        print(f"Using EXPANDED masks for registration: fixed - {fixed_mask_expanded}, moving - {moving_mask_expanded}")
+    elif fixed_mask_expanded and use_masks:
+        registration_command.extend(["--masks", f"[{fixed_mask_expanded}]"])
+        print(f"Using EXPANDED fixed mask for registration: {fixed_mask_expanded}")
+    
+    #output registration command to .txt file
+    ANTsCommand_output = os.path.join(output_dir, ants_command)
+    #format raw ants command
+    ants_command=format_command_string(str(registration_command))
+    #write output
+    with open(ANTsCommand_output, "w") as f:
+        f.write(ants_command)
+    #
+    print(f"Written ANTs command to {ANTsCommand_output}")
     
     # Run the registration command
-    print(f"Running ANTs command: {' '.join(registration_command)}")
+    print(f"Running ANTs registration...")
     try:
         subprocess.run(registration_command, check=True)
         print("Registration completed successfully.")
@@ -777,14 +868,14 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
         print(f"Registration failed: {e}")
         return False
     
-    # Apply the resulting transformations to the moving image
-    moving_warped_output = os.path.join(output_dir, f"{output_prefix}warped.nii.gz")
+    # Apply the resulting transformations to the ORIGINAL moving image
+    moving_warped_output = os.path.join(output_dir, f"{output_prefix}warped{output_filetype}")
     apply_transform_command = [
         ants_apply,
         "-d", dimensions,
         "-v", "1",
-        "-i", moving,
-        "-r", fixed,
+        "-i", moving,  # ORIGINAL moving image
+        "-r", fixed,  # ORIGINAL fixed image as reference
         "-n", "linear",
         "-t", warp_file,
         "-t", affine_file,
@@ -793,19 +884,18 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
     
     try:
         subprocess.run(apply_transform_command, check=True)
-        print(f"Applied transform to moving image. Output saved at {moving_warped_output}.")
+        print(f"Applied transform to ORIGINAL moving image. Output: {moving_warped_output}")
     except subprocess.CalledProcessError as e:
         print(f"Failed to apply transform to moving image: {e}")
-        # Don't return here, continue with other transforms
     
-    # Apply inverse transforms to the fixed image
-    fixed_warped_output = os.path.join(output_dir, f"{output_prefix}inv_warped.nii.gz")
+    # Apply inverse transforms to the ORIGINAL fixed image
+    fixed_warped_output = os.path.join(output_dir, f"{output_prefix}inv_warped{output_filetype}")
     inverse_transform_command = [
         ants_apply,
         "-d", dimensions,
         "-v", "1",
-        "-i", fixed,
-        "-r", moving,
+        "-i", fixed,  # ORIGINAL fixed image
+        "-r", moving,  # ORIGINAL moving image as reference
         "-n", "linear",
         "-t", f"[{affine_file},1]",
         "-t", inv_warp_file,
@@ -814,21 +904,21 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
     
     try:
         subprocess.run(inverse_transform_command, check=True)
-        print(f"Applied inverse transform to fixed image. Output saved at {fixed_warped_output}.")
+        print(f"Applied inverse transform to ORIGINAL fixed image. Output: {fixed_warped_output}")
     except subprocess.CalledProcessError as e:
         print(f"Failed to apply inverse transform to fixed image: {e}")
     
-    # Apply transforms to masks if they exist
+    # Apply transforms to ORIGINAL masks (non-expanded) if they exist
     moving_mask_warped_output = None
     fixed_mask_warped_output = None
     
-    if moving_mask:
-        moving_mask_warped_output = os.path.join(output_dir, f"{output_prefix}mask_warped.nii.gz")
+    if moving_mask_original:
+        moving_mask_warped_output = os.path.join(output_dir, f"{output_prefix}mask_warped{output_filetype}")
         apply_transform_mask_command = [
             ants_apply,
             "-d", dimensions,
             "-v", "1",
-            "-i", moving_mask,
+            "-i", moving_mask_original,  # ORIGINAL (non-expanded) mask
             "-r", fixed,
             "-n", "NearestNeighbor",
             "-t", warp_file,
@@ -838,18 +928,18 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
         
         try:
             subprocess.run(apply_transform_mask_command, check=True)
-            print(f"Applied transform to moving mask. Output saved at {moving_mask_warped_output}.")
+            print(f"Applied transform to ORIGINAL moving mask. Output: {moving_mask_warped_output}")
         except subprocess.CalledProcessError as e:
             print(f"Failed to apply transform to moving mask: {e}")
             moving_mask_warped_output = None
     
-    if fixed_mask:
-        fixed_mask_warped_output = os.path.join(output_dir, f"{output_prefix}mask_inv_warped.nii.gz")
+    if fixed_mask_original:
+        fixed_mask_warped_output = os.path.join(output_dir, f"{output_prefix}mask_inv_warped{output_filetype}")
         inverse_transform_mask_command = [
             ants_apply,
             "-d", dimensions,
             "-v", "1",
-            "-i", fixed_mask,
+            "-i", fixed_mask_original,  # ORIGINAL (non-expanded) mask
             "-r", moving,
             "-n", "NearestNeighbor",
             "-t", inv_warp_file,
@@ -859,7 +949,7 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
         
         try:
             subprocess.run(inverse_transform_mask_command, check=True)
-            print(f"Applied inverse transform to fixed mask. Output saved at {fixed_mask_warped_output}.")
+            print(f"Applied inverse transform to ORIGINAL fixed mask. Output: {fixed_mask_warped_output}")
         except subprocess.CalledProcessError as e:
             print(f"Failed to apply inverse transform to fixed mask: {e}")
             fixed_mask_warped_output = None
@@ -867,7 +957,7 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
     print("All transformations applied successfully.")
     
     # Calculate registration accuracy metrics if masks are available
-    if fixed_mask and moving_mask and moving_mask_warped_output:
+    if fixed_mask_original and moving_mask_original and moving_mask_warped_output:
         print("Computing Registration quality measures...")
         metrics_output = os.path.join(output_dir, f"{output_prefix}0_reg_accuracy.csv")
         
@@ -875,7 +965,7 @@ def run_reg(fixed, moving, output_dir, output_prefix, fixed_mask=None,
             metrics = calculate_registration_accuracy(
                 fixed_img_path=fixed,
                 warped_moving_path=moving_warped_output,
-                fixed_mask_path=fixed_mask,
+                fixed_mask_path=fixed_mask_original,
                 warped_moving_mask_path=moving_mask_warped_output,
                 output_path=metrics_output
             )
@@ -905,7 +995,8 @@ DFs = prep_reg(
     Fixed_mask=img_fix_mask,
     Moving_mask=img_mov_mask,
     reg_mask=reg_expand_mask,
-    dimensions=dimensions
+    dimensions=dimensions,
+    output_filetype=output_filetype
 )
 
 print("Script execution complete.")
