@@ -2,13 +2,8 @@
 """
 Created on Wed Jun  4 11:26:59 2025
 
-@author: will Clark
+@author: Will Clark
 
-FIXED VERSION:
-- Registration uses EXPANDED masks
-- Transform application uses ORIGINAL (non-masked) images
-- Output masking uses ORIGINAL (non-expanded) masks
-- Added file type specification for outputs
 """
 #%%Packages
 
@@ -52,9 +47,7 @@ To run manually:
         >"Load Directory"
         >"Run script"
 --
-Registration parameters can be edited: in the run_reg() function
-    Search for: <Reg Params>
-    Currently set up for General MRI alignment - very good on 1H MRI
+Registration parameters need to be defined by input BASH script, can pass ANTs command as a string, with placeholders {output_prefix_full_placeholder}, {fixed_placeholder}, and {moving_placeholder} and {addmasks} or {nomasks}
 """
 
 #%% BASH Input
@@ -80,6 +73,9 @@ parser.add_argument('-out_type', '--output_filetype', help="Output file type (e.
 parser.add_argument('-saveinputs', '--save_input_copies', 
                     help="Save copies of input images and masks to registration directory", 
                     action='store_true', default=False)
+parser.add_argument('-masked_inputs','--use_masked_inputs', 
+                    help="Apply Masks (if found) to the input fixed and moving images prior to registration - works independently of mask definitions in ANTs command call.", 
+                    action='store_true', default=False)
 
 # Parse arguments
 args = parser.parse_args()
@@ -100,6 +96,7 @@ output_directory = str(args.output_directory) if args.output_directory else None
 reg_expand_mask = int(args.reg_expand_mask) if args.reg_expand_mask else 8
 output_filetype = str(args.output_filetype) if args.output_filetype else '.nii.gz'
 save_input_copies = args.save_input_copies
+use_mask_inputs = args.use_masked_inputs if args.use_masked_inputs else None
 
 # Ensure output filetype starts with a dot
 if not output_filetype.startswith('.'):
@@ -120,169 +117,146 @@ print(f"Output File Type: {output_filetype}")
 
 #%% Load Directory functions
 
-# Try to import the helper function, fall back to local if it fails
-try:
-    sys.path.append(r'\shared\polaris2\shared\will\_scripts')
-    from Organisation.Directory_Functions import load_dir, load_img_dir
-    print("Successfully imported helper functions from shared directory")
+def load_img_dir(load_dir):
+    """Load image directory"""
+    img_list = os.listdir(load_dir)
+    print(f"Found images: {img_list}")
+    return img_list
 
-except (ImportError, ModuleNotFoundError) as e:
-    print(f"Could not import helper functions: {e}")
-    print("Falling back to local implementation")
+def load_dir(source_dir, folder, subfolder=False, timepoint=False, filenames=False, List_all=False):
+    """
+    Load images from nested patient directory. Operates on a single patient.
 
-    def load_img_dir(load_dir):
-        """Load image directory"""
-        img_list = os.listdir(load_dir)
-        print(f"Found images: {img_list}")
-        return img_list
+    Structure should be: Data_Folder / Patient IDs / Scan session / folder.
 
-    def load_dir(source_dir, folder, subfolder=False, timepoint=False, filenames=False, List_all=False):
-        """
-        Load images from nested patient directory. Operates on a single patient.
+    Args:
+        source_dir: Base directory where patient folders are located.
+        folder: Folder name to load from each scan session.
+        subfolder: Subfolder within the specified folder (optional).
+        timepoint: Specific time points to load (default: loads all).
+        filenames: Specific filename patterns to search for.
+        List_all: If True, includes directories in the output; otherwise, only lists images.
 
-        Structure should be: Data_Folder / Patient IDs / Scan session / folder.
+    Returns:
+        Table_out: DataFrame containing image filenames and their directory paths.
+    """
+    Table_out = pd.DataFrame()
 
-        Args:
-            source_dir: Base directory where patient folders are located.
-            folder: Folder name to load from each scan session.
-            subfolder: Subfolder within the specified folder (optional).
-            timepoint: Specific time points to load (default: loads all).
-            filenames: Specific filename patterns to search for.
-            List_all: If True, includes directories in the output; otherwise, only lists images.
+    print("Loading Directory Tree...")
+    print(f"Directory to search: {source_dir}")
+    print(f"Specified Timepoint(s): {timepoint}")
+    print(f"Specified Folder(s): {folder}")
+    print(f"Specified Subfolder(s): {subfolder}")
+    print(f"Specified filename(s): {filenames}")
 
-        Returns:
-            Table_out: DataFrame containing image filenames and their directory paths.
-        """
-        Table_out = pd.DataFrame()
+    def load_folder(fdir, dirs_to_find=False):
+        """Load single folder's contents"""
+        single_dir_requested = False
 
-        print("Loading Directory Tree...")
-        print(f"Directory to search: {source_dir}")
-        print(f"Specified Timepoint(s): {timepoint}")
-        print(f"Specified Folder(s): {folder}")
-        print(f"Specified Subfolder(s): {subfolder}")
-        print(f"Specified filename(s): {filenames}")
-
-        def load_folder(fdir, dirs_to_find=False):
-            """Load single folder's contents"""
-            single_dir_requested = False
-
-            if dirs_to_find:
-                if isinstance(dirs_to_find, (list, np.ndarray)):
-                    dirs_to_find_list = np.array(dirs_to_find)
-                    if len(dirs_to_find_list) == 1:
-                        single_dir_requested = True
-                else:
-                    dirs_to_find_list = np.array([dirs_to_find])
+        if dirs_to_find:
+            if isinstance(dirs_to_find, (list, np.ndarray)):
+                dirs_to_find_list = np.array(dirs_to_find)
+                if len(dirs_to_find_list) == 1:
                     single_dir_requested = True
-
-                if not os.path.exists(fdir):
-                    print(f"Error: Directory '{fdir}' does not exist.")
-                    return np.array([])
             else:
-                if not os.path.exists(fdir):
-                    print(f"Error: Directory '{fdir}' does not exist.")
-                    return np.array([])
+                dirs_to_find_list = np.array([dirs_to_find])
+                single_dir_requested = True
 
-                dirs_to_find_list = np.array(sorted([
-                    d for d in os.listdir(fdir)
-                    if os.path.isdir(os.path.join(fdir, d))
-                ]))
-
-            existing_dirs = []
-            for directory in dirs_to_find_list:
-                if os.path.isdir(os.path.join(fdir, directory)):
-                    existing_dirs.append(directory)
-                else:
-                    print(f"Warning: Subdirectory '{directory}' not found in '{fdir}'")
-
-            if single_dir_requested and len(existing_dirs) == 0:
-                return None
-
-            return np.array(existing_dirs)
-
-        def load_folder_imgs(fdir, files_to_find=False):
-            """Find image files in a directory matching specified substring patterns"""
+            if not os.path.exists(fdir):
+                print(f"Error: Directory '{fdir}' does not exist.")
+                return np.array([])
+        else:
             if not os.path.exists(fdir):
                 print(f"Error: Directory '{fdir}' does not exist.")
                 return np.array([])
 
-            single_pattern_requested = False
+            dirs_to_find_list = np.array(sorted([
+                d for d in os.listdir(fdir)
+                if os.path.isdir(os.path.join(fdir, d))
+            ]))
 
-            print("Loading files in directory...")
-            if files_to_find:
-                if isinstance(files_to_find, (list, np.ndarray)):
-                    patterns_list = np.array(files_to_find)
-                    if len(patterns_list) == 1:
-                        single_pattern_requested = True
-                else:
-                    patterns_list = np.array([files_to_find])
-                    single_pattern_requested = True
-
-                matching_files = []
-                for pattern in patterns_list:
-                    pattern_matches = glob.glob(os.path.join(fdir, f"*{pattern}*"))
-                    pattern_matches = [os.path.basename(f) for f in pattern_matches]
-                    matching_files.extend(pattern_matches)
-
-                matching_files = sorted(list(set(matching_files)))
+        existing_dirs = []
+        for directory in dirs_to_find_list:
+            if os.path.isdir(os.path.join(fdir, directory)):
+                existing_dirs.append(directory)
             else:
-                print("No specified files, listing all...")
-                matching_files = sorted(glob.glob(os.path.join(fdir, "*")))
-                matching_files = [os.path.basename(f) for f in matching_files if os.path.isfile(f)]
+                print(f"Warning: Subdirectory '{directory}' not found in '{fdir}'")
 
-            if single_pattern_requested and len(matching_files) == 0:
-                print("No matching files...")
-                return None
+        if single_dir_requested and len(existing_dirs) == 0:
+            return None
 
-            print(f"Files found: {matching_files}")
-            return np.array(matching_files)
+        return np.array(existing_dirs)
 
-        # Run script
-        patient_path = os.path.join(source_dir)
-        print("--")
+    def load_folder_imgs(fdir, files_to_find=False):
+        """Find image files in a directory matching specified substring patterns"""
+        if not os.path.exists(fdir):
+            print(f"Error: Directory '{fdir}' does not exist.")
+            return np.array([])
 
-        print("Loading Patient Time Point(s)...")
-        timepoints = load_folder(fdir=patient_path, dirs_to_find=timepoint)
+        single_pattern_requested = False
 
-        for timepoint in timepoints:
-            print(f"Time point - {timepoint}")
-            time_point_path = os.path.join(patient_path, timepoint)
+        print("Loading files in directory...")
+        if files_to_find:
+            if isinstance(files_to_find, (list, np.ndarray)):
+                patterns_list = np.array(files_to_find)
+                if len(patterns_list) == 1:
+                    single_pattern_requested = True
+            else:
+                patterns_list = np.array([files_to_find])
+                single_pattern_requested = True
 
-            print("Loading specified Folder(s)...")
-            Folders = load_folder(fdir=time_point_path, dirs_to_find=folder)
+            matching_files = []
+            for pattern in patterns_list:
+                pattern_matches = glob.glob(os.path.join(fdir, f"*{pattern}*"))
+                pattern_matches = [os.path.basename(f) for f in pattern_matches]
+                matching_files.extend(pattern_matches)
 
-            if Folders is None:
-                print("No folders located")
-                return None
+            matching_files = sorted(list(set(matching_files)))
+        else:
+            print("No specified files, listing all...")
+            matching_files = sorted(glob.glob(os.path.join(fdir, "*")))
+            matching_files = [os.path.basename(f) for f in matching_files if os.path.isfile(f)]
 
-            for Folder in Folders:
-                print(f"Folder - {Folder}")
-                folder_path = os.path.join(time_point_path, Folder)
+        if single_pattern_requested and len(matching_files) == 0:
+            print("No matching files...")
+            return None
 
-                if subfolder:
-                    print("Loading specified subfolder(s)...")
-                    subfolders = load_folder(fdir=folder_path, dirs_to_find=subfolder)
+        print(f"Files found: {matching_files}")
+        return np.array(matching_files)
 
-                    if subfolders is None:
-                        print("No subfolders located")
-                        return None
+    # Run script
+    patient_path = os.path.join(source_dir)
+    print("--")
 
-                    for subfolder in subfolders:
-                        print(f"Sub-Folder - {subfolder}")
-                        DataFolder = os.path.join(folder_path, subfolder)
-                        imgs = load_folder_imgs(fdir=DataFolder, files_to_find=filenames)
+    print("Loading Patient Time Point(s)...")
+    timepoints = load_folder(fdir=patient_path, dirs_to_find=timepoint)
 
-                        if imgs is None or (isinstance(imgs, np.ndarray) and len(imgs) == 0):
-                            print(f"{folder} Directory is empty!")
-                            imgs = np.array(["None"])
+    for timepoint in timepoints:
+        print(f"Time point - {timepoint}")
+        time_point_path = os.path.join(patient_path, timepoint)
 
-                        data_to_bind = {
-                            'Images': [imgs],
-                            'Directory': [DataFolder]
-                        }
-                        output_scans = pd.DataFrame(data_to_bind)
-                else:
-                    DataFolder = folder_path
+        print("Loading specified Folder(s)...")
+        Folders = load_folder(fdir=time_point_path, dirs_to_find=folder)
+
+        if Folders is None:
+            print("No folders located")
+            return None
+
+        for Folder in Folders:
+            print(f"Folder - {Folder}")
+            folder_path = os.path.join(time_point_path, Folder)
+
+            if subfolder:
+                print("Loading specified subfolder(s)...")
+                subfolders = load_folder(fdir=folder_path, dirs_to_find=subfolder)
+
+                if subfolders is None:
+                    print("No subfolders located")
+                    return None
+
+                for subfolder in subfolders:
+                    print(f"Sub-Folder - {subfolder}")
+                    DataFolder = os.path.join(folder_path, subfolder)
                     imgs = load_folder_imgs(fdir=DataFolder, files_to_find=filenames)
 
                     if imgs is None or (isinstance(imgs, np.ndarray) and len(imgs) == 0):
@@ -294,10 +268,23 @@ except (ImportError, ModuleNotFoundError) as e:
                         'Directory': [DataFolder]
                     }
                     output_scans = pd.DataFrame(data_to_bind)
+            else:
+                DataFolder = folder_path
+                imgs = load_folder_imgs(fdir=DataFolder, files_to_find=filenames)
 
-                Table_out = pd.concat([Table_out, output_scans], ignore_index=True)
+                if imgs is None or (isinstance(imgs, np.ndarray) and len(imgs) == 0):
+                    print(f"{folder} Directory is empty!")
+                    imgs = np.array(["None"])
 
-        return Table_out
+                data_to_bind = {
+                    'Images': [imgs],
+                    'Directory': [DataFolder]
+                }
+                output_scans = pd.DataFrame(data_to_bind)
+
+            Table_out = pd.concat([Table_out, output_scans], ignore_index=True)
+
+    return Table_out
 
 #%% Load directories
 
@@ -379,20 +366,43 @@ def find_match(array, search_string):
             return string
     return None
 
-def expand_mask_radially(mask_image, radius=8):
-    """
-    Expand a binary mask radially by specified number of voxels.
-    Ensures mask is in UInt8 format before dilation.
-    """
-    if mask_image.GetPixelID() != sitk.sitkUInt8:
-        print(f"Converting mask from {mask_image.GetPixelIDTypeAsString()} to UInt8 for dilation...")
-        mask_image = sitk.Cast(mask_image > 0, sitk.sitkUInt8)  # binarize + cast
+# def expand_mask_radially(mask_image, radius=8):
+#     """
+#     Expand a binary mask radially by specified number of voxels.
+#     Ensures mask is in UInt8 format before dilation.
+#     """
+#     if mask_image.GetPixelID() != sitk.sitkUInt8:
+#         print(f"Converting mask from {mask_image.GetPixelIDTypeAsString()} to UInt8 for dilation...")
+#         mask_image = sitk.Cast(mask_image > 0, sitk.sitkUInt8)  # binarize + cast
     
-    dilate_filter = sitk.BinaryDilateImageFilter()
-    dilate_filter.SetKernelRadius(radius)
-    dilate_filter.SetKernelType(sitk.sitkBall)
-    expanded_mask = dilate_filter.Execute(mask_image)
-    return expanded_mask
+#     dilate_filter = sitk.BinaryDilateImageFilter()
+#     dilate_filter.SetKernelRadius(radius)
+#     dilate_filter.SetKernelType(sitk.sitkBall)
+#     expanded_mask = dilate_filter.Execute(mask_image)
+#     return expanded_mask
+
+def expand_mask_radially(mask_image, radius=2):
+    """Correctly preserve all metadata."""
+    
+    # Step 2: Convert to UInt8 if needed
+    if mask_image.GetPixelID() != sitk.sitkUInt8:
+        mask_uint8 = sitk.Cast(mask_image, sitk.sitkUInt8)
+    else:
+        mask_uint8 = mask_image
+    
+    # Step 3: Dilate (this preserves metadata if input has correct metadata)
+    dilated = sitk.BinaryDilate(mask_uint8, [radius]*3)
+    
+    # Step 4: EXPLICITLY copy metadata from original image (safety check)
+    dilated.CopyInformation(mask_image)
+    
+    # Step 5: Verify metadata was preserved
+    assert dilated.GetSpacing() == mask_image.GetSpacing(), "Spacing mismatch!"
+    assert dilated.GetOrigin() == mask_image.GetOrigin(), "Origin mismatch!"
+    assert dilated.GetDirection() == mask_image.GetDirection(), "Direction mismatch!"
+    assert dilated.GetSize() == mask_image.GetSize(), "Size mismatch!"
+    
+    return dilated
 
 def calculate_registration_accuracy(fixed_img_path: str,
                                    warped_moving_path: str,
@@ -540,7 +550,7 @@ def format_command_string(cmd_string):
 
 def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8, 
              ants_reg_params_str=None, output_base_dir=None, Fixed_mask=None, 
-             Moving_mask=None, dimensions="3", output_filetype='.nii.gz'):
+             Moving_mask=None, dimensions="3", output_filetype='.nii.gz', mask_inputs=False):
     
     
     global fix_img_path
@@ -711,32 +721,52 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
         print("Creating Registration Directory...")
         os.makedirs(Reg_dir, exist_ok=True)
         
-        
+        # Parameters for optional arguments and output directories.
         fix_seg_expanded_path = None
         mov_seg_expanded_path = None
+        masked_fix = None
+        masked_mov = None
+        fix_img_path_tmp = os.path.join(Reg_dir, "_fixed_image.nii.gz")
+        mov_img_path_tmp = os.path.join(Reg_dir, "_moving_image.nii.gz")
         # Save expanded masks for ANTs registration
-        if has_segs and fix_seg_sitk_expanded is not None and mov_seg_sitk_expanded is not None:
+        if has_segs:
             
+            if fix_seg_sitk_expanded is not None:
+                fix_seg_expanded_path = os.path.join(Reg_dir, "_fixed_mask_expanded.nii.gz")
+                save_sitk(fix_seg_sitk_expanded, fix_seg_expanded_path)
+                
             #
-            fix_seg_expanded_path = os.path.join(Reg_dir, "_fixed_mask_expanded.nii.gz")
-            mov_seg_expanded_path = os.path.join(Reg_dir, "_moving_mask_expanded.nii.gz")
-            
-            save_sitk(fix_seg_sitk_expanded, fix_seg_expanded_path)
-            save_sitk(mov_seg_sitk_expanded, mov_seg_expanded_path)
+            if mov_seg_sitk_expanded is not None:
+                mov_seg_expanded_path = os.path.join(Reg_dir, "_moving_mask_expanded.nii.gz")
+                save_sitk(mov_seg_sitk_expanded, mov_seg_expanded_path)
+            #
             print("Expanded masks saved for registration")
+            #
         
+            #Additional level if "use_mask_inputs" is true: save images to temporary name, and override paths of fixed image and moving image
+            if use_mask_inputs and fix_seg_sitk_expanded and mov_seg_sitk_expanded:
+                #
+                print("Overriding inputs with masked image copies...")
+                masked_fix = apply_mask(image=fix_img_sitk, mask=fix_seg_sitk_expanded)
+                masked_mov = apply_mask(image=mov_img_sitk, mask=mov_seg_sitk_expanded)
+                #
+                save_sitk(masked_fix, fix_img_path_tmp)
+                save_sitk(masked_mov, mov_img_path_tmp)
+                #Override file paths for input images
+                fix_img_path=fix_img_path_tmp
+                mov_img_path=mov_img_path_tmp
+                #
+            #
+        #
         #Save output images -saveinputs
-        
         if save_input_copies:
             print("Saving input copies to registration directory...")
               
-            #Save fixed and moving image to registration folder
-            fix_img_path_tmp = os.path.join(Reg_dir, "_fixed_image.nii.gz")
-            mov_img_path_tmp = os.path.join(Reg_dir, "_moving_image.nii.gz")
-            
-            save_sitk(fix_img_sitk, fix_img_path_tmp)
-            save_sitk(mov_img_sitk, mov_img_path_tmp)
-            print("Moving and fixed image saved to ouput directory")
+            #Save fixed and moving image to registration folder (if not overriding with use_mask_inputs)
+            if not use_mask_inputs:
+                save_sitk(fix_img_sitk, fix_img_path_tmp)
+                save_sitk(mov_img_sitk, mov_img_path_tmp)
+                print("Moving and fixed image saved to ouput directory")
             
             #Save fixed and moving maks to registration folder
             if fix_seg_sitk_original and mov_seg_sitk_original:
@@ -783,28 +813,20 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
 def run_reg(fixed, moving, output_dir, output_prefix, 
             fixed_mask_original=None, moving_mask_original=None,
             fixed_mask_expanded=None, moving_mask_expanded=None,
-            ants_path=None, use_masks=False, 
+            ants_path=None, use_masks=False,
             ants_reg_params_template=None, dimensions="3", output_filetype='.nii.gz'):
     """
-    Perform image registration using ANTs with optional masking and output the transforms.
+    Perform image registration using ANTs with flexible mask placeholders.
     
-    MASK HANDLING:
-    - Registration uses EXPANDED masks (fixed_mask_expanded, moving_mask_expanded)
-    - Transform application uses ORIGINAL images (fixed, moving - not pre-masked)
-    - Output masking uses ORIGINAL masks (fixed_mask_original, moving_mask_original)
+    MASK PLACEHOLDERS:
+    - {addmasks}: Replaced with real masks if provided, or dummy masks if not
+    - {nomasks}: Always replaced with dummy "all-ones" masks (effectively no masking)
     
-    Args:
-        fixed: Path to ORIGINAL fixed image (not pre-masked)
-        moving: Path to ORIGINAL moving image (not pre-masked)
-        fixed_mask_original: Path to original (non-expanded) fixed mask
-        moving_mask_original: Path to original (non-expanded) moving mask
-        fixed_mask_expanded: Path to expanded fixed mask (for registration constraint)
-        moving_mask_expanded: Path to expanded moving mask (for registration constraint)
-        output_filetype: Output file extension (e.g., '.nii.gz', '.mha')
-    
-    Returns:
-        Tuple or False: Returns tuple of output files if successful, False if failed
+    Dummy masks are created automatically with same dimensions as images, all voxels = 1.
+    This allows per-stage mask control while satisfying ANTs' "N masks for N stages" requirement.
     """
+    import SimpleITK as sitk
+    
     # Set the ANTs registration and apply transform paths
     ants_registration = os.path.join(ants_path, 'antsRegistration') if ants_path else 'antsRegistration'
     ants_apply = os.path.join(ants_path, 'antsApplyTransforms') if ants_path else 'antsApplyTransforms'
@@ -818,9 +840,61 @@ def run_reg(fixed, moving, output_dir, output_prefix,
     
     print("=" * 80)
     print("REGISTRATION CONFIGURATION:")
-    print(f"  Using ORIGINAL images for transform application: {os.path.basename(fixed)}, {os.path.basename(moving)}")
-    if use_masks and fixed_mask_expanded:
-        print(f"  Using EXPANDED masks for registration constraint")
+    print(f"  Using ORIGINAL images for transform application:")
+    print(f"    Fixed:  {os.path.basename(fixed)}")
+    print(f"    Moving: {os.path.basename(moving)}")
+    
+    # ========================================
+    # CREATE DUMMY MASKS (all ones)
+    # ========================================
+    fixed_img = sitk.ReadImage(fixed)
+    moving_img = sitk.ReadImage(moving)
+    
+    # Create dummy masks - all voxels = 1
+    dummy_fixed_mask = sitk.Image(fixed_img.GetSize(), sitk.sitkUInt8)
+    dummy_fixed_mask.CopyInformation(fixed_img)
+    dummy_fixed_mask = dummy_fixed_mask + 1  # All voxels = 1
+    
+    dummy_moving_mask = sitk.Image(moving_img.GetSize(), sitk.sitkUInt8)
+    dummy_moving_mask.CopyInformation(moving_img)
+    dummy_moving_mask = dummy_moving_mask + 1  # All voxels = 1
+    
+    # Save dummy masks
+    dummy_fixed_mask_path = os.path.join(output_dir, "_dummy_fixed_mask.nii.gz")
+    dummy_moving_mask_path = os.path.join(output_dir, "_dummy_moving_mask.nii.gz")
+    sitk.WriteImage(dummy_fixed_mask, dummy_fixed_mask_path)
+    sitk.WriteImage(dummy_moving_mask, dummy_moving_mask_path)
+    
+    print(f"  Created dummy masks (all voxels = 1):")
+    print(f"    Dummy fixed:  {os.path.basename(dummy_fixed_mask_path)}")
+    print(f"    Dummy moving: {os.path.basename(dummy_moving_mask_path)}")
+    
+    # ========================================
+    # BUILD MASK STRINGS
+    # ========================================
+    # Real masks (if provided)
+    if use_masks and fixed_mask_expanded and moving_mask_expanded:
+        real_mask_string = f'--masks "[{fixed_mask_expanded},{moving_mask_expanded}]"'
+        print(f"  Using EXPANDED masks for stages with {{addmasks}}:")
+        print(f"    Fixed mask:  {os.path.basename(fixed_mask_expanded)}")
+        print(f"    Moving mask: {os.path.basename(moving_mask_expanded)}")
+    elif use_masks and fixed_mask_expanded:
+        real_mask_string = f'--masks "[{fixed_mask_expanded}]"'
+        print(f"  Using EXPANDED fixed mask for stages with {{addmasks}}")
+    else:
+        # If no real masks provided, {addmasks} also uses dummy masks
+        real_mask_string = f'--masks "[{dummy_fixed_mask_path},{dummy_moving_mask_path}]"'
+        print(f"  No real masks provided - {{addmasks}} will use dummy masks")
+    
+    # Dummy masks (always available)
+    dummy_mask_string = f'--masks "[{dummy_fixed_mask_path},{dummy_moving_mask_path}]"'
+    print(f"  Stages with {{nomasks}} will use dummy masks (effectively no masking)")
+    
+    # Count placeholders
+    num_addmasks = ants_reg_params_template.count('{addmasks}')
+    num_nomasks = ants_reg_params_template.count('{nomasks}')
+    print(f"  Found {num_addmasks} {{addmasks}} and {num_nomasks} {{nomasks}} placeholders")
+    
     if use_masks and fixed_mask_original:
         print(f"  Using ORIGINAL masks for output warping")
     print(f"  Output file type: {output_filetype}")
@@ -828,35 +902,31 @@ def run_reg(fixed, moving, output_dir, output_prefix,
     
     print("Defining ANTs parameters and running registration...")
     
-    # Replace placeholders in the ANTs command string
+    # ========================================
+    # REPLACE ALL PLACEHOLDERS
+    # ========================================
     formatted_ants_reg_params = ants_reg_params_template.replace(
         "{fixed_placeholder}", fixed
     ).replace(
         "{moving_placeholder}", moving
     ).replace(
         "{output_prefix_full_placeholder}", output_prefix_full
+    ).replace(
+        "{addmasks}", real_mask_string
+    ).replace(
+        "{nomasks}", dummy_mask_string
     )
     
     # Build registration command
     registration_command = [ants_registration] + shlex.split(formatted_ants_reg_params)
     
-    
-    # Add the EXPANDED mask argument if provided (for registration constraint)
-    if fixed_mask_expanded and moving_mask_expanded and use_masks:
-        registration_command.extend(["--masks", f"[{fixed_mask_expanded},{moving_mask_expanded}]"])
-        print(f"Using EXPANDED masks for registration: fixed - {fixed_mask_expanded}, moving - {moving_mask_expanded}")
-    elif fixed_mask_expanded and use_masks:
-        registration_command.extend(["--masks", f"[{fixed_mask_expanded}]"])
-        print(f"Using EXPANDED fixed mask for registration: {fixed_mask_expanded}")
-    
-    #output registration command to .txt file
+    # Output registration command to .txt file
     ANTsCommand_output = os.path.join(output_dir, ants_command)
-    #format raw ants command
-    ants_command=format_command_string(str(registration_command))
-    #write output
+    ants_command_formatted = format_command_string(str(registration_command))
+    
     with open(ANTsCommand_output, "w") as f:
-        f.write(ants_command)
-    #
+        f.write(ants_command_formatted)
+    
     print(f"Written ANTs command to {ANTsCommand_output}")
     
     # Run the registration command
@@ -868,14 +938,16 @@ def run_reg(fixed, moving, output_dir, output_prefix,
         print(f"Registration failed: {e}")
         return False
     
+    # ... (rest of the function - transform application, etc. - unchanged)
+    
     # Apply the resulting transformations to the ORIGINAL moving image
     moving_warped_output = os.path.join(output_dir, f"{output_prefix}warped{output_filetype}")
     apply_transform_command = [
         ants_apply,
         "-d", dimensions,
         "-v", "1",
-        "-i", moving,  # ORIGINAL moving image
-        "-r", fixed,  # ORIGINAL fixed image as reference
+        "-i", moving,
+        "-r", fixed,
         "-n", "linear",
         "-t", warp_file,
         "-t", affine_file,
@@ -894,8 +966,8 @@ def run_reg(fixed, moving, output_dir, output_prefix,
         ants_apply,
         "-d", dimensions,
         "-v", "1",
-        "-i", fixed,  # ORIGINAL fixed image
-        "-r", moving,  # ORIGINAL moving image as reference
+        "-i", fixed,
+        "-r", moving,
         "-n", "linear",
         "-t", f"[{affine_file},1]",
         "-t", inv_warp_file,
@@ -908,7 +980,7 @@ def run_reg(fixed, moving, output_dir, output_prefix,
     except subprocess.CalledProcessError as e:
         print(f"Failed to apply inverse transform to fixed image: {e}")
     
-    # Apply transforms to ORIGINAL masks (non-expanded) if they exist
+    # Apply transforms to ORIGINAL masks if they exist
     moving_mask_warped_output = None
     fixed_mask_warped_output = None
     
@@ -918,7 +990,7 @@ def run_reg(fixed, moving, output_dir, output_prefix,
             ants_apply,
             "-d", dimensions,
             "-v", "1",
-            "-i", moving_mask_original,  # ORIGINAL (non-expanded) mask
+            "-i", moving_mask_original,
             "-r", fixed,
             "-n", "NearestNeighbor",
             "-t", warp_file,
@@ -939,7 +1011,7 @@ def run_reg(fixed, moving, output_dir, output_prefix,
             ants_apply,
             "-d", dimensions,
             "-v", "1",
-            "-i", fixed_mask_original,  # ORIGINAL (non-expanded) mask
+            "-i", fixed_mask_original,
             "-r", moving,
             "-n", "NearestNeighbor",
             "-t", inv_warp_file,
@@ -979,6 +1051,27 @@ def run_reg(fixed, moving, output_dir, output_prefix,
     else:
         print("Skipping registration metrics (no masks available)")
     
+    
+    #Cleanup Dummy masks
+    #
+    deleted_count = 0
+    for dummy_mask_path in [dummy_fixed_mask_path, dummy_moving_mask_path]:
+        if os.path.exists(dummy_mask_path):
+            try:
+                os.remove(dummy_mask_path)
+                print(f"  Deleted: {os.path.basename(dummy_mask_path)}")
+                deleted_count += 1
+            except Exception as e:
+                print(f"  Warning: Could not delete {os.path.basename(dummy_mask_path)}: {e}")
+        else:
+            print(f"  Dummy mask not found (may not have been created): {os.path.basename(dummy_mask_path)}")
+    
+    if deleted_count > 0:
+        print(f"Successfully cleaned up {deleted_count} temporary mask file(s).")
+    #
+    
+    #
+    #Return
     return (warp_file, affine_file, moving_warped_output, fixed_warped_output, 
             moving_mask_warped_output, fixed_mask_warped_output)
 
@@ -996,7 +1089,8 @@ DFs = prep_reg(
     Moving_mask=img_mov_mask,
     reg_mask=reg_expand_mask,
     dimensions=dimensions,
-    output_filetype=output_filetype
+    output_filetype=output_filetype,
+    mask_inputs=use_mask_inputs
 )
 
 print("Script execution complete.")
