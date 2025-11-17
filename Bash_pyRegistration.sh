@@ -95,11 +95,12 @@ sdir=/pyRegistration.py # Registration Script 			# Change this to where the pyRe
 AntsRegCmd=""
 AntsRegCmd+="--dimensionality 3 "                                                                                          											# Change if using 2D Images
 AntsRegCmd+="--verbose 1 "                                                                                                 											# Enable verbosity
-AntsRegCmd+="--output \"{output_prefix_full_placeholder}\" " 																										                                # Handles output for raw transform files
+AntsRegCmd+="--output \"{output_prefix_full_placeholder}\" " 																										# Handles output for raw transform files
 AntsRegCmd+="--use-histogram-matching 1 "                                                                                  											# Histogram Matching
 AntsRegCmd+="--initial-moving-transform \"[{fixed_placeholder},{moving_placeholder},1]\" "                                 											# Initial Transform step
 
 # ====== First registration step - RIGID ======
+AntsRegCmd+="{nomasks} "
 AntsRegCmd+="--transform \"Rigid[0.1]\" "
 AntsRegCmd+="--metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" "
 AntsRegCmd+="--convergence \"1000x500x250x100\" "
@@ -107,6 +108,7 @@ AntsRegCmd+="--smoothing-sigmas \"3x2x1x0\" "
 AntsRegCmd+="--shrink-factors \"8x4x2x1\" "
 
 # ====== Second registration step - AFFINE ======
+AntsRegCmd+="{addmasks} "
 AntsRegCmd+="--transform \"Affine[0.1]\" "
 AntsRegCmd+="--metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" "
 AntsRegCmd+="--convergence \"1000x500x250x100\" "
@@ -114,38 +116,43 @@ AntsRegCmd+="--smoothing-sigmas \"3x2x1x0\" "
 AntsRegCmd+="--shrink-factors \"8x4x2x1\" "
 
 # ====== Third registration step - DEFORMABLE (BSplineSyN) ======
+AntsRegCmd+="{addmasks} "
 AntsRegCmd+="--transform \"BSplineSyN[0.2,65,0,3]\" "
 AntsRegCmd+="--metric \"CC[{fixed_placeholder},{moving_placeholder},1,2]\" "
 AntsRegCmd+="--convergence \"500x200x70x50x10\" "
 AntsRegCmd+="--smoothing-sigmas \"5x3x2x1x0\" "
 AntsRegCmd+="--shrink-factors \"10x6x4x2x1\""
 
+#AntsRegCmd+="{addmasks} " #If you want to globally define masks to use for all steps, remove other lines with masks and uncomment this.
+
 #--------------------------------------
 # RUN PYTHON SCRIPT - Python call
-python $sdir -pat_dir $patient_dir -scn_dir "Image_Folder" -seg_dir "Mask_Folder" -f "FixedImageName" -m "MovingImageName" -f_mask "EXPIRATION" -m_mask "INSPIRATION" -ants_path $ap -ants_reg_params "$AntsRegCmd"																			#<<-[EDIT]
+python $sdir -pat_dir $patient_dir -scn_dir "Image_Folder" -seg_dir "Mask_Folder" -f "FixedImageName" -m "MovingImageName" -f_mask "EXPIRATION" -m_mask "INSPIRATION" -ants_path $ap -ants_reg_params "$AntsRegCmd" -saveinputs -masked_inputs																			#<<-[EDIT]
 #
+
 ################################################################################
 # PYTHON SCRIPT PARAMETERS REFERENCE
 ################################################################################
 #
 # REQUIRED:
-#   -pat_dir     : Patient directory path
-#   -scn_dir     : Image folder name
-#   -seg_dir     : Mask folder name
-#   -f           : Fixed image identifier substring
-#   -m           : Moving image identifier substring
-#   -ants_path   : Path to ANTs binaries
+#   -pat_dir     	 : Patient directory path
+#   -scn_dir     	 : Image folder name
+#   -seg_dir     	 : Mask folder name
+#   -f           	 : Fixed image identifier substring
+#   -m           	 : Moving image identifier substring
+#   -ants_path   	 : Path to ANTs binaries
 #   -ants_reg_params : ANTs registration command string
 #
 # OPTIONAL:
-#   -f_mask      : Fixed mask identifier substring
-#   -m_mask      : Moving mask identifier substring
-#   -out_dir     : Output directory path
-#   -reg_exp_mask: Mask expansion size (0-10, default: 8) (this is for registration only!)
-#   -dim         : Image dimensions (2 or 3, default: 3)
-#   -sub_dir     : Additional subdirectory level (if needed)
-#	-out_type	   : Image output filetype (default is .nii.gz, supports most 3d medical image types)
-#   -saveinputs    : saves copies of input images to registraton destination folder 
+#   -f_mask      	: Fixed mask identifier substring
+#   -m_mask      	: Moving mask identifier substring
+#   -out_dir     	: Output directory path
+#   -reg_exp_mask	: Mask expansion size (0-10, default: 8) (this is for registration only!)
+#   -dim         	: Image dimensions (2 or 3, default: 3)
+#   -sub_dir     	: Additional subdirectory level (if needed)
+#	-out_type	 	: Image output filetype (default is .nii.gz, supports most 3d medical image types)
+#	-saveinputs  	: Saves input images to registration directory (images, masks, expanded masks)
+#	-masked_inputs	: Overrides input fixed and moving images with masked copies (will always save input images to directory) - Potentially fixes bug with using ANTs's mask handling.
 #
 ################################################################################
 
@@ -179,4 +186,26 @@ python $sdir -pat_dir $patient_dir -scn_dir "Image_Folder" -seg_dir "Mask_Folder
 #   Reg_MOVING_2_FIXED_0_reg_accuracy.csv (if masks used)
 #       - Registration quality metrics (Dice, Jaccard, etc.)
 #
+#---OPTIONAL OUTPUTS-----------------------------------------
+#
+#	_fixed_image.nii.gz (if -saveinputs)
+#		- Fixed image (used in registration)
+#
+#	_moving_image.nii.gz (if -saveinputs)
+#		- Fixed image (used in registration)
+#
+#	_fixed_mask.nii.gz (if -saveinputs and if masks used)
+#		-Fixed image mask
+#
+#	_moving_mask.nii.gz (if -saveinputs and if masks used)
+#		-Moving image mask
+#
+#	_fixed_mask_expanded.nii.gz (if -saveinputs and if masks used)
+#		-Expanded Fixed image mask (used in registration)
+#
+#	_moving_mask_expanded.nii.gz (if -saveinputs and if masks used)
+#		-Expanded Moving image mask (used in registration)
+#
+#
 ################################################################################
+
