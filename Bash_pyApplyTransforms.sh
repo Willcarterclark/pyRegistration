@@ -24,123 +24,168 @@ source ~/.bashrc
 module load apps/python/conda
 source activate pyRegistration
 
-# ANTs path
-ap=/usr/local/community/polaris/tools/ants/2.5.1/bin/
+# ANTs path (on HPC System)
+ap=/path/to/ANTS/ # <<-[EDIT] #/usr/local/community/polaris/tools/ants/2.5.1/bin/
 
 # ==================================================================================================================
 # CONFIGURATION SECTION - Please edit these parameters
 # ==================================================================================================================
 
 # Data directory containing patient folders
-dir=/path/to/directory/with/patient/folders  									# <<-[EDIT]
-
-# Transform directory pattern - where to find the transforms
-# Options:
-#   1. For single registration (normal mode): "Reg_TLC_2_RV"
-#   2. For composite transforms: "Reg_TLC_2_RV_composite"
-
-transform_folder="Reg_TLC_2_RV"  												# <<-[EDIT] - Name of folder containing transforms
-
-# Image folder to process (foldername contining the image you want to transform)
-image_folder="img"  															# <<-[EDIT] - Folder containing images to transform 
-
-# Reference image identifier (what the images will be transformed to)
-reference_identifier="RV"  														# <<-[EDIT] - String to identify reference image
-
-# Optional: Specific subfolder within image folder (if you need another level to search fr)
-subfolder=""  																	# <<-[EDIT] - Leave empty if not needed
-
-# Optional: Output directory (if empty, saves in transform folder)
-output_base_dir=""  															# <<-[EDIT] - Leave empty to save in transform folder
-
-# Transform type (leave empty for auto-detection)
-# Options: "--composite" for composite, "--standard" for standard, or "" for auto
-transform_type=""  																# <<-[EDIT] - Usually leave empty for auto-detection
-
-# Optional: Include only specific images (space-separated identifiers)
-# Example: "TLC FRC" to only transform TLC and FRC images
-include_images=""  																# <<-[EDIT] - Leave empty to include all
-
-# Optional: Exclude specific images (space-separated identifiers)
-# Example: "mask seg" to exclude masks and segmentations
-exclude_images="mask seg"  														# <<-[EDIT] - Common exclusions
-
-# Image dimensions
-dimensions="3"  																# <<-[EDIT] - Change to "2" for 2D images
-
-
-# Path to apply transforms script
-apply_script=/apply_transforms.py  # <<-[EDIT] - Update path to where python script is located
+dir=/shared/director/to/dataset/  # <<-[EDIT]
 
 # ==================================================================================================================
 # SCRIPT EXECUTION - Don't edit below unless you know what you're doing
 # ==================================================================================================================
 
+# Path to apply transforms script
+apply_script=/path/to/script/pyApplyTransforms.py  # <<-[EDIT] - Update path to where python script is located
+
 # Get patient ID from job array
 patient_id=`ls "$dir" | sed -n "$SGE_TASK_ID"p`
 patient_dir=$dir/$patient_id
 
-echo "=========================================="
-echo "Processing patient: $patient_id"
-echo "Patient directory: $patient_dir"
-echo "Transform folder: $transform_folder"
-echo "=========================================="
-
-# Find the transform directory
-# Look for the transform folder within the patient directory
-transform_dir=""
-for d in $(find "$patient_dir" -type d -name "*$transform_folder*" 2>/dev/null); do
-    if [ -d "$d" ]; then
-        transform_dir="$d"
-        echo "Found transform directory: $transform_dir"
-        break
-    fi
-done
-
-# Check if transform directory was found
-if [ -z "$transform_dir" ]; then
-    echo "ERROR: Could not find transform directory matching pattern: $transform_folder"
-    echo "Searched in: $patient_dir"
-    exit 1
-fi
-
-# Build the Python command from inputs
-cmd="python $apply_script"
-cmd="$cmd -pat_dir $patient_dir"
-cmd="$cmd -trans_dir $transform_dir"
-cmd="$cmd -img_folder $image_folder"
-cmd="$cmd -ref $reference_identifier"
-cmd="$cmd -ants_path $ap"
-cmd="$cmd -dim $dimensions"
-
-# Add optional parameters if specified
-if [ ! -z "$subfolder" ]; then
-    cmd="$cmd -sub_folder $subfolder"
-fi
-
-if [ ! -z "$output_base_dir" ]; then
-    cmd="$cmd -out_dir $output_base_dir"
-fi
-
-if [ ! -z "$transform_type" ]; then
-    cmd="$cmd $transform_type"
-fi
-
-if [ ! -z "$include_images" ]; then
-    cmd="$cmd -include $include_images"
-fi
-
-if [ ! -z "$exclude_images" ]; then
-    cmd="$cmd -exclude $exclude_images"
-fi
-
-echo "Running command:"
-echo "$cmd"
-echo "------------------------------------------"
+#
+echo "Running Patient: "
+echo $patient_id
+echo "=========================="
 
 # Run the Python script
-$cmd
+# ------------------------------------------
+# Transform images
+# ------------------------------------------
+# Apply XeFRC->RV registration to XeFRC images
+python $apply_script --mode tree \
+    -pat_dir $patient_dir \
+    -trans_folder "Reg__1H-XeFRC_2__RV" \
+    -img_folder "img" \
+    -ref "RV" \
+    -include "_XeFRC" \
+    -exclude "mask" "seg" \ #excluse mask and seg images
+    -out_dir "Vent_XeFRC_2_RV" \
+    -ants_path $ap \
+    -dim "3"
+
+# Apply HeFRC->RV registration to HeFRC images
+python $apply_script --mode tree \
+    -pat_dir $patient_dir \
+    -trans_folder "Reg__1H-HeFRC_2__RV" \
+    -img_folder "img" \
+    -ref "RV" \
+    -include "_HeFRC" \
+    -exclude "mask" "seg" \
+    -out_dir "Vent_HeFRC_2_RV" \
+    -ants_path $ap \
+    -dim "3"
+
+# ------------------------------------------
+# Transform masks (segmentations)
+# ------------------------------------------
+# XeFRC masks
+python $apply_script --mode tree \
+    -pat_dir $patient_dir \
+    -trans_folder "Reg__1H-XeFRC_2__RV" \
+    -img_folder "seg" \
+    -ref "RV" \
+    -include "_1H-XeFRC" \
+    -exclude "img" \
+    -out_dir "Vent_XeFRC_2_RV" \
+    -ants_path $ap \
+    -dim "3"
+
+# HeFRC masks
+python $apply_script --mode tree \
+    -pat_dir $patient_dir \
+    -trans_folder "Reg__1H-HeFRC_2__RV" \
+    -img_folder "seg" \
+    -ref "RV" \
+    -include "_1H-HeFRC" \
+    -exclude "img" \
+    -out_dir "Vent_HeFRC_2_RV" \
+    -ants_path $ap \
+    -dim "3"
+
+# ------------------------------------------
+# Inverse transforms (commented out)
+# ------------------------------------------
+# python $apply_script --mode tree \
+#     -pat_dir $patient_dir \
+#     -trans_folder "Reg__RV_2__1H-XeFRC" \
+#     -img_folder "img" \
+#     -ref "_XeFRC" \
+#     -include "_XeFRC" \
+#     -exclude "mask" "seg" \
+#     -out_dir "Vent_1HVent_2_XeFRC" \
+#     -ants_path $ap \
+#     -dim "3"
+
+# python $apply_script --mode tree \
+#     -pat_dir $patient_dir \
+#     -trans_folder "Reg__RV_2__1H-HeFRC" \
+#     -img_folder "img" \
+#     -ref "_HeFRC" \
+#     -include "_HeFRC" \
+#     -exclude "mask" "seg" \
+#     -out_dir "Vent_1HVent_2_HeFRC" \
+#     -ants_path $ap \
+#     -dim "3"
 
 echo "=========================================="
 echo "Completed processing for patient $patient_id"
 echo "=========================================="
+
+# ==================================================================================================================
+# PARAMETER REFERENCE
+# ==================================================================================================================
+# --mode          : Processing mode - "direct", "tree", or "vent" (REQUIRED)
+# -pat_dir        : Patient directory path
+# -trans_folder   : Registration folder name containing transform files (*0GenericAffine.mat, *1Warp.nii.gz)
+# -img_folder     : Folder name containing images to transform (e.g., "img", "seg")
+# -ref            : Reference image identifier string (e.g., "RV", "TLC") - searches patient tree automatically
+# -out_dir        : Output directory name (created within patient tree if relative path)
+# -ants_path      : Path to ANTs binaries
+# -dim            : Image dimensions - "2" or "3" (default: "3")
+# -sub_folder     : [TREE] Optional subfolder within img_folder
+# -include        : Include only images matching these patterns (space-separated)
+# -exclude        : Exclude images matching these patterns (space-separated)
+# -timepoint      : Process specific timepoint(s) only (e.g., "mrA", "Visit1")
+# -vent_dirs      : [VENT] Ventilation type folders (e.g., "Vent_Int Vent_Trans")
+# -vent_strings   : [VENT] Folder:prefix mapping (e.g., "Vent_Int:sVent Vent_Trans:JacVent")
+# -vent_filters   : [VENT] Additional filename filters (e.g., "_medfilt_3.nii.gz")
+
+# ==================================================================================================================
+# EXAMPLE COMMANDS
+# ==================================================================================================================
+# --- TREE MODE: Images in standard tree structure (Patient/visit/folder/images) ---
+# python $apply_script --mode tree \
+#     -pat_dir /data/Patient01 \
+#     -trans_folder "Reg__TLC_2__RV" \
+#     -img_folder "img" \
+#     -ref "RV" \
+#     -include "TLC" "FRC" \
+#     -exclude "mask" "seg" \
+#     -out_dir "transformed_images" \
+#     -ants_path /path/to/ants/bin \
+#     -dim "3"
+
+# --- VENT MODE: Ventilation images within registration folder ---
+# python $apply_script --mode vent \
+#     -pat_dir /data/Patient01 \
+#     -trans_folder "Reg__TLC_2__RV" \
+#     -ref "RV" \
+#     -vent_dirs "Vent_Int" "Vent_Trans" "Vent_Hyb3" \
+#     -vent_strings "Vent_Int:sVent" "Vent_Trans:JacVent" "Vent_Hyb3:HYCID" \
+#     -vent_filters "_medfilt_3.nii.gz" \
+#     -ants_path /path/to/ants/bin \
+#     -dim "3"
+
+# --- DIRECT MODE: Single image transform ---
+# python $apply_script --mode direct \
+#     --direct_image /data/Patient01/visit1/img/TLC.nii.gz \
+#     --direct_transform_dir /data/Patient01/visit1/Reg__TLC_2__RV \
+#     --direct_reference /data/Patient01/visit1/img/RV.nii.gz \
+#     --direct_output /data/Patient01/visit1/output/TLC_transformed.nii.gz \
+#     -ants_path /path/to/ants/bin \
+#     -dim "3"
+
+# ==================================================================================================================
