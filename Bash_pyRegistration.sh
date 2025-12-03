@@ -50,8 +50,12 @@ mkdir -p qsuboutput/ #Make logging directory
 #
 # 3) With the python environment "pyRegistration" set up now run this code to 'enter' the enviromnent to set up modules > :
 #	> source activate pyRegistration
+# 
+# 4)a Install via requirements.txt -> pip install -r requirements.txt  
 #
-# 4) Install the required python packages using "conda install" (or "pip install" if it doesnt work)
+# or:
+#
+# 4)b Install the required python packages using "conda install" (or "pip install" if it doesnt work)
 #	> conda install:
 # 		SimpleITK
 # 		pandas
