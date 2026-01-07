@@ -63,6 +63,7 @@ python $apply_script --mode tree \
     -include "_XeFRC" \
     -exclude "mask" "seg" \ #excluse mask and seg images
     -out_dir "Vent_XeFRC_2_RV" \
+    -transform_mode forward \
     -ants_path $ap \
     -dim "3"
 
@@ -75,6 +76,7 @@ python $apply_script --mode tree \
     -include "_HeFRC" \
     -exclude "mask" "seg" \
     -out_dir "Vent_HeFRC_2_RV" \
+    -transform_mode forward \
     -ants_path $ap \
     -dim "3"
 
@@ -90,6 +92,7 @@ python $apply_script --mode tree \
     -include "_1H-XeFRC" \
     -exclude "img" \
     -out_dir "Vent_XeFRC_2_RV" \
+    -transform_mode forward \
     -ants_path $ap \
     -dim "3"
 
@@ -103,6 +106,7 @@ python $apply_script --mode tree \
     -exclude "img" \
     -out_dir "Vent_HeFRC_2_RV" \
     -ants_path $ap \
+    -transform_mode forward \
     -dim "3"
 
 # ------------------------------------------
@@ -138,8 +142,17 @@ echo "=========================================="
 # PARAMETER REFERENCE
 # ==================================================================================================================
 # --mode          : Processing mode - "direct", "tree", or "vent" (REQUIRED)
+# -transform_mode   : Transform mode - "forward" (default), "inverse", "warp_only", "inverse_warp_only" (REQUIRED)
+#
+# Explicit transform file specification (optional - overrides auto-detection):
+# -affine_file      : Explicit affine transform filename (relative to transform folder or absolute)
+# -warp_file        : Explicit warp transform filename (relative to transform folder or absolute)
+# -inverse_warp_file: Explicit inverse warp transform filename (relative to transform folder or absolute)
+#
 # -pat_dir        : Patient directory path
+# -vent_dir		  : Patient Ventilation path (usually needed if using vent mode - as ventilation images are not in main patient folder, but in parallel folder)
 # -trans_folder   : Registration folder name containing transform files (*0GenericAffine.mat, *1Warp.nii.gz)
+# -vent_trans_folder : Registration folder name for ventilation images containing ventilation images (usually needed if using vent mode - as ventilation images are not in main patient folder, but in parallel folder)
 # -img_folder     : Folder name containing images to transform (e.g., "img", "seg")
 # -ref            : Reference image identifier string (e.g., "RV", "TLC") - searches patient tree automatically
 # -out_dir        : Output directory name (created within patient tree if relative path)
@@ -152,6 +165,39 @@ echo "=========================================="
 # -vent_dirs      : [VENT] Ventilation type folders (e.g., "Vent_Int Vent_Trans")
 # -vent_strings   : [VENT] Folder:prefix mapping (e.g., "Vent_Int:sVent Vent_Trans:JacVent")
 # -vent_filters   : [VENT] Additional filename filters (e.g., "_medfilt_3.nii.gz")
+#
+
+# ==================================================================================================================
+# TRANSFORM MODE REFERENCE
+# ==================================================================================================================
+#
+# Given a registration: Reg_{moving}_2_{fixed}
+# 
+# Transform files produced:
+#   - Reg_{moving}_2_{fixed}_0GenericAffine.mat    (affine transform)
+#   - Reg_{moving}_2_{fixed}_1Warp.nii.gz          (forward warp: moving -> fixed)
+#   - Reg_{moving}_2_{fixed}_1InverseWarp.nii.gz   (inverse warp: fixed -> moving)
+#
+# TRANSFORM MODES:
+#
+# 1. forward (default):
+#    - Applies: Warp + Affine
+#    - Use case: Transform image from moving space to fixed space
+#    - Example: You have TLC image, reg is Reg__TLC_2__RV, you want TLC in RV space
+#
+# 2. inverse:
+#    - Applies: InverseWarp + Affine(inverted)
+#    - Use case: Transform image from fixed space to moving space  
+#    - Example: You have RV image, reg is Reg__TLC_2__RV, you want RV in TLC space
+#
+# 3. warp_only:
+#    - Applies: Only the Warp (no affine)
+#    - Use case: When you have composite transforms or only want deformable part
+#
+# 4. inverse_warp_only:
+#    - Applies: Only the InverseWarp (no affine)
+#    - Use case: Reverse direction without affine component
+#
 
 # ==================================================================================================================
 # EXAMPLE COMMANDS
@@ -166,6 +212,7 @@ echo "=========================================="
 #     -exclude "mask" "seg" \
 #     -out_dir "transformed_images" \
 #     -ants_path /path/to/ants/bin \
+#     -transform_mode forward \
 #     -dim "3"
 
 # --- VENT MODE: Ventilation images within registration folder ---
@@ -177,6 +224,7 @@ echo "=========================================="
 #     -vent_strings "Vent_Int:sVent" "Vent_Trans:JacVent" "Vent_Hyb3:HYCID" \
 #     -vent_filters "_medfilt_3.nii.gz" \
 #     -ants_path /path/to/ants/bin \
+#     -transform_mode forward \
 #     -dim "3"
 
 # --- DIRECT MODE: Single image transform ---
@@ -186,6 +234,7 @@ echo "=========================================="
 #     --direct_reference /data/Patient01/visit1/img/RV.nii.gz \
 #     --direct_output /data/Patient01/visit1/output/TLC_transformed.nii.gz \
 #     -ants_path /path/to/ants/bin \
+#     -transform_mode forward \
 #     -dim "3"
 
 # ==================================================================================================================
