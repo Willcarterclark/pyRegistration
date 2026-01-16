@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Apply Transform Script - Version 3.1 (Flexible Transform Modes)
+Apply Transform Script - Version 3.2 (Fixed Inverse Transform Order)
 --
 by Will Clark 
 POLARIS - University of Sheffield
@@ -12,18 +12,23 @@ Supports three input modes:
 3. VENT: Apply transforms to ventilation images within registration folders 
          (Patient/visit/Reg_folder/Vent_folder/images)
 
-v3.1: Flexible transform mode control
+NEW in v3.1: Flexible transform mode control
     - forward: Standard affine + warp (default, backward compatible)
     - inverse: Affine (inverted) + InverseWarp 
     - warp_only: Single warp file only (for composite transforms)
     - inverse_warp_only: Single inverse warp only
+
+NEW in v3.2: 
+    - Fixed inverse transform order: Now correctly applies InverseWarp first, then inverted Affine
+      (Command line: -t [Affine.mat,1] -t InverseWarp.nii.gz)
+    - Added inverse_use_ants flag: Force using forward warp with ANTs inversion flag instead
+      of pre-generated inverse warp file
 
 Output Structure:
     TREE mode: {output_dir}/{patient}/{visit}/{regfolder}/{img_folder}/(subfolder)/
     VENT mode: {output_dir}/{patient}/{visit}/{regfolder}/{vent_folder}/
     DIRECT mode: {output_dir}/{patient_id}/
 """
-
 
 import os
 import argparse
@@ -80,6 +85,7 @@ class TransformFiles:
         composite: Path to composite transform (if single-file format)
         transform_type: 'standard', 'composite', 'explicit', or 'unknown'
         user_specified: Whether files were explicitly specified by user
+        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
     """
     affine: Optional[str] = None
     warp: Optional[str] = None
@@ -87,6 +93,7 @@ class TransformFiles:
     composite: Optional[str] = None
     transform_type: str = "unknown"
     user_specified: bool = False
+    inverse_use_ants: bool = False
     
     @classmethod
     def from_explicit_files(cls, transform_dir: str, 
@@ -198,16 +205,29 @@ class TransformFiles:
                 if self.composite:
                     transforms.append({'path': self.composite, 'invert': True})
             else:
-                # Inverse: affine (inverted) then inverse_warp 
-                # Since ANTs applies in reverse order, we specify: inverse_warp, then affine[inverted]
-                if self.inverse_warp:
+                # Inverse of T = Warp ∘ Affine is T^{-1} = Affine^{-1} ∘ InverseWarp
+                # Execution order: InverseWarp first, then Affine^{-1} second
+                # ANTs applies transforms in REVERSE order (last specified = first applied)
+                # So we specify: affine[inverted] first, then inverse_warp second
+                # This produces: -t [Affine.mat,1] -t InverseWarp.nii.gz
+                # ANTs will apply InverseWarp first, then inverted Affine second
+                if self.affine:
+                    transforms.append({'path': self.affine, 'invert': True})
+                
+                # Handle warp inversion - either use inverse warp file or ANTs inversion flag
+                if self.inverse_use_ants:
+                    # Force using forward warp with ANTs inversion flag
+                    if self.warp:
+                        logger.info("Using forward warp with ANTs inversion flag (inverse_use_ants=True)")
+                        transforms.append({'path': self.warp, 'invert': True})
+                    else:
+                        logger.warning("inverse_use_ants=True but no forward warp found")
+                elif self.inverse_warp:
                     transforms.append({'path': self.inverse_warp, 'invert': False})
                 elif self.warp:
                     # Fallback: invert the forward warp if no inverse available
                     logger.warning("No inverse warp found, using forward warp with inversion flag")
                     transforms.append({'path': self.warp, 'invert': True})
-                if self.affine:
-                    transforms.append({'path': self.affine, 'invert': True})
                     
         elif mode == TransformMode.WARP_ONLY:
             if self.transform_type == 'composite':
@@ -303,10 +323,11 @@ manual_params = {
     'affine_file': None,         # e.g., 'Reg__TLC_2__RV_0GenericAffine.mat'
     'warp_file': None,           # e.g., 'Reg__TLC_2__RV_1Warp.nii.gz'
     'inverse_warp_file': None,   # e.g., 'Reg__TLC_2__RV_1InverseWarp.nii.gz'
+    'inverse_use_ants': False,   # If True, use forward warp with ANTs inversion flag instead of inverse warp file
     
     # Common parameters
-    'patient_dir': r'',
-    'ants_path': r'',
+    'patient_dir': r'/path',
+    'ants_path': r'/path', #Use None if you want to use antspy
     'dimensions': '3',
     
     # Transform location parameters
@@ -340,7 +361,7 @@ manual_params = {
     'exclude_images': ['mask', 'seg'],  # List of identifiers to exclude
 }
 
-# Default ventilation directories and strings (backward compatibility) (ONLY USED FOR VENT MODE)
+# Default ventilation directories and strings (backward compatibility)
 DEFAULT_VENT_DIRS = ["Vent_Int", "Vent_Trans", "Vent_Hyb", "Vent_Hyb2", "Vent_Hyb3"]
 DEFAULT_VENT_STRINGS = {
     'Vent_Int': 'sVent', 
@@ -656,7 +677,7 @@ def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
 #%% Transform Finding Functions (Updated for TransformFiles dataclass)
 
 def find_transform_files(transform_dir, affine_file=None, warp_file=None, 
-                        inverse_warp_file=None) -> TransformFiles:
+                        inverse_warp_file=None, inverse_use_ants=False) -> TransformFiles:
     """
     Find and identify transform files in a directory.
     
@@ -667,6 +688,7 @@ def find_transform_files(transform_dir, affine_file=None, warp_file=None,
         affine_file: Optional explicit affine filename (relative or absolute)
         warp_file: Optional explicit warp filename (relative or absolute)
         inverse_warp_file: Optional explicit inverse warp filename (relative or absolute)
+        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
     
     Returns:
         TransformFiles: Dataclass with all found transform file paths
@@ -676,15 +698,18 @@ def find_transform_files(transform_dir, affine_file=None, warp_file=None,
     
     if has_explicit:
         logger.info("Using explicitly specified transform files")
-        return TransformFiles.from_explicit_files(
+        result = TransformFiles.from_explicit_files(
             transform_dir, 
             affine_file=affine_file,
             warp_file=warp_file,
             inverse_warp_file=inverse_warp_file
         )
+        result.inverse_use_ants = inverse_use_ants
+        return result
     
     # Auto-detection mode
     transforms = TransformFiles()
+    transforms.inverse_use_ants = inverse_use_ants
     
     if not os.path.exists(transform_dir):
         logger.error(f"Transform directory does not exist: {transform_dir}")
@@ -728,11 +753,15 @@ def find_transform_files(transform_dir, affine_file=None, warp_file=None,
         if affine_files:
             transforms.affine = affine_files[0]
     
+    if inverse_use_ants:
+        logger.info("inverse_use_ants=True: Will use forward warp with ANTs inversion flag for inverse transforms")
+    
     return transforms
 
 
 def find_transform_in_tree(patient_dir, reg_folder, timepoint=None,
-                          affine_file=None, warp_file=None, inverse_warp_file=None):
+                          affine_file=None, warp_file=None, inverse_warp_file=None,
+                          inverse_use_ants=False):
     """
     Find transform files within a tree structure.
     Pattern: patient_dir / timepoint / reg_folder / transforms
@@ -744,6 +773,7 @@ def find_transform_in_tree(patient_dir, reg_folder, timepoint=None,
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
+        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
     
     Returns:
         tuple: (transform_dir, TransformFiles, actual_reg_folder_name, timepoint_used)
@@ -780,7 +810,8 @@ def find_transform_in_tree(patient_dir, reg_folder, timepoint=None,
             reg_path, 
             affine_file=affine_file,
             warp_file=warp_file,
-            inverse_warp_file=inverse_warp_file
+            inverse_warp_file=inverse_warp_file,
+            inverse_use_ants=inverse_use_ants
         )
         
         if transform_files.has_forward_transforms() or transform_files.has_inverse_transforms():
@@ -895,6 +926,10 @@ def apply_transform_to_image(image_path, output_path, transform_files: Transform
     logger.info(f"Applying transform ({transform_mode.value}) to: {os.path.basename(image_path)}")
     logger.debug(f"Command: {' '.join(apply_command)}")
     
+    
+    #Output formatted Transform command to .txt file (similar to the main registration script!)
+    
+    
     try:
         result = subprocess.run(apply_command, check=True, capture_output=True, text=True)
         logger.info(f"  Success! Output: {output_path}")
@@ -977,6 +1012,7 @@ def build_output_path_direct(output_dir, patient_id):
 def process_direct_mode(image_path, transform_dir, reference_path, output_path,
                        transform_mode=TransformMode.FORWARD,
                        affine_file=None, warp_file=None, inverse_warp_file=None,
+                       inverse_use_ants=False,
                        ants_path=None, dimensions="3", patient_id=None, output_dir=None):
     """
     Process a single image directly.
@@ -990,6 +1026,7 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
+        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
         ants_path: Path to ANTs binaries
         dimensions: Image dimensions
         patient_id: Patient ID for output structure
@@ -1007,6 +1044,8 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
     logger.info(f"Transform mode: {transform_mode.value}")
     if any([affine_file, warp_file, inverse_warp_file]):
         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
+    if inverse_use_ants:
+        logger.info(f"inverse_use_ants: {inverse_use_ants}")
     logger.info("=" * 70)
     
     results = {'success': 0, 'skipped': 0, 'failed': 0}
@@ -1016,7 +1055,8 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
         transform_dir,
         affine_file=affine_file,
         warp_file=warp_file,
-        inverse_warp_file=inverse_warp_file
+        inverse_warp_file=inverse_warp_file,
+        inverse_use_ants=inverse_use_ants
     )
     
     if transform_files.transform_type == 'unknown':
@@ -1067,6 +1107,7 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
 def process_tree_mode(patient_dir, img_folder, transform_folder, reference_identifier,
                      transform_mode=TransformMode.FORWARD,
                      affine_file=None, warp_file=None, inverse_warp_file=None,
+                     inverse_use_ants=False,
                      ants_path=None, output_dir=None, subfolder=None, timepoint=None,
                      include_images=None, exclude_images=None, dimensions="3"):
     """
@@ -1083,6 +1124,7 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
+        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
         ants_path: Path to ANTs binaries
         output_dir: Output directory (None = save in transform folder)
         subfolder: Optional subfolder within img_folder
@@ -1104,6 +1146,8 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
     logger.info(f"Transform mode: {transform_mode.value}")
     if any([affine_file, warp_file, inverse_warp_file]):
         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
+    if inverse_use_ants:
+        logger.info(f"inverse_use_ants: {inverse_use_ants}")
     logger.info("=" * 70)
     
     results = {'success': 0, 'skipped': 0, 'failed': 0}
@@ -1124,7 +1168,8 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
         patient_dir, transform_folder, timepoint,
         affine_file=affine_file,
         warp_file=warp_file,
-        inverse_warp_file=inverse_warp_file
+        inverse_warp_file=inverse_warp_file,
+        inverse_use_ants=inverse_use_ants
     )
     
     if transform_files is None:
@@ -1213,6 +1258,7 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
 def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg_folder, 
                      reference_identifier, transform_mode=TransformMode.FORWARD,
                      affine_file=None, warp_file=None, inverse_warp_file=None,
+                     inverse_use_ants=False,
                      ants_path=None, output_dir=None, timepoint=None,
                      vent_dirs=None, vent_strings=None, vent_filters=None,
                      include_images=None, exclude_images=None, dimensions="3"):
@@ -1231,6 +1277,7 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
+        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
         ants_path: Path to ANTs binaries
         output_dir: Output directory (None = save in transform folder)
         timepoint: Specific timepoint(s)
@@ -1254,6 +1301,8 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
     logger.info(f"Vent directories: {vent_dirs}")
     if any([affine_file, warp_file, inverse_warp_file]):
         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
+    if inverse_use_ants:
+        logger.info(f"inverse_use_ants: {inverse_use_ants}")
     logger.info("=" * 70)
     
     if vent_dirs is None:
@@ -1291,7 +1340,8 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
         patient_dir, reg_folder, timepoint,
         affine_file=affine_file,
         warp_file=warp_file,
-        inverse_warp_file=inverse_warp_file
+        inverse_warp_file=inverse_warp_file,
+        inverse_use_ants=inverse_use_ants
     )
     
     if transform_files is None:
@@ -1417,6 +1467,9 @@ Examples:
                        help="Explicit warp transform filename (relative to transform folder or absolute path)")
     parser.add_argument('-inverse_warp_file', '--inverse_warp_file', type=str,
                        help="Explicit inverse warp transform filename (relative to transform folder or absolute path)")
+    parser.add_argument('-inverse_use_ants', '--inverse_use_ants', action='store_true',
+                       default=False,
+                       help="For inverse mode: use forward warp with ANTs inversion flag instead of pre-generated inverse warp file")
     
     # Common arguments
     parser.add_argument('-pat_dir', '--patient_dir', type=Path,
@@ -1514,6 +1567,7 @@ def main():
         affine_file = manual_params.get('affine_file')
         warp_file = manual_params.get('warp_file')
         inverse_warp_file = manual_params.get('inverse_warp_file')
+        inverse_use_ants = manual_params.get('inverse_use_ants', False)
         
         if mode == 'direct':
             process_direct_mode(
@@ -1525,6 +1579,7 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
+                inverse_use_ants=inverse_use_ants,
                 ants_path=manual_params['ants_path'],
                 dimensions=manual_params['dimensions'],
                 patient_id=manual_params.get('patient_id'),
@@ -1541,6 +1596,7 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
+                inverse_use_ants=inverse_use_ants,
                 ants_path=manual_params['ants_path'],
                 output_dir=manual_params.get('output_dir'),
                 subfolder=manual_params.get('sub_folder'),
@@ -1561,6 +1617,7 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
+                inverse_use_ants=inverse_use_ants,
                 ants_path=manual_params['ants_path'],
                 output_dir=manual_params.get('output_dir'),
                 timepoint=manual_params.get('timepoint'),
@@ -1584,6 +1641,7 @@ def main():
         affine_file = args.affine_file
         warp_file = args.warp_file
         inverse_warp_file = args.inverse_warp_file
+        inverse_use_ants = args.inverse_use_ants
         
         if mode == 'direct':
             # Validate required arguments
@@ -1602,6 +1660,7 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
+                inverse_use_ants=inverse_use_ants,
                 ants_path=str(args.ants_path) if args.ants_path else None,
                 dimensions=args.dimensions,
                 patient_id=args.patient_id,
@@ -1623,6 +1682,7 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
+                inverse_use_ants=inverse_use_ants,
                 ants_path=str(args.ants_path) if args.ants_path else None,
                 output_dir=str(args.output_dir) if args.output_dir else None,
                 subfolder=args.sub_folder,
@@ -1650,6 +1710,7 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
+                inverse_use_ants=inverse_use_ants,
                 ants_path=str(args.ants_path) if args.ants_path else None,
                 output_dir=str(args.output_dir) if args.output_dir else None,
                 timepoint=args.timepoint,
