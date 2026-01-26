@@ -1,33 +1,70 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Apply Transform Script - Version 3.2 (Fixed Inverse Transform Order)
+Apply Transform Script - Version 3.5 (Structured reference image search)
 --
-by Will Clark 
+by Will Clark
 POLARIS - University of Sheffield
 --
 Supports three input modes:
 1. DIRECT: Apply transforms to a single image file
 2. TREE: Apply transforms to images in a nested tree structure (Patient/visit/folder/images)
-3. VENT: Apply transforms to ventilation images within registration folders 
+3. VENT: Apply transforms to ventilation images within registration folders
          (Patient/visit/Reg_folder/Vent_folder/images)
 
 NEW in v3.1: Flexible transform mode control
     - forward: Standard affine + warp (default, backward compatible)
-    - inverse: Affine (inverted) + InverseWarp 
+    - inverse: Affine (inverted) + InverseWarp
     - warp_only: Single warp file only (for composite transforms)
     - inverse_warp_only: Single inverse warp only
 
-NEW in v3.2: 
+NEW in v3.2:
     - Fixed inverse transform order: Now correctly applies InverseWarp first, then inverted Affine
       (Command line: -t [Affine.mat,1] -t InverseWarp.nii.gz)
-    - Added inverse_use_ants flag: Force using forward warp with ANTs inversion flag instead
-      of pre-generated inverse warp file
+    - Added ANTs command file output: Each transformed image now generates a companion
+      *_ANTsCall.txt file containing the exact ANTs command used, formatted for direct
+      execution from HPC terminal (both single-line and multi-line formats)
+
+NEW in v3.3:
+    - VENT mode: Auto-generated output folder naming based on transformation chain
+      Output registration folder is now: {vent_trans_folder}_2_{ref_target}
+      Example: Input from "Reg__TLC_2__RV" transformed to "_1H-HeFRC" target
+               -> Output folder: "Reg__TLC_2__RV_2_1H-HeFRC"
+    - This eliminates the need to manually specify -out_dir in most VENT mode cases
+
+NEW in v3.4:
+    - Output filename suffix control (-out_str):
+      * Default (None): No suffix added - output filename matches input
+      * "True": Adds "_transformed" suffix
+      * Custom string: Adds that string as suffix (e.g., "_warped")
+    - Output file type control (-o_filetype):
+      * Default (None): Preserve input file type
+      * Specify output format: .nii.gz, .nii, .mha, .mhd, .nrrd
+    - Supported input file types: .nii, .nii.gz, .mha, .mhd, .nrrd
+
+NEW in v3.5:
+    - Structured reference image search using tree structure:
+      * -ref_folder: Folder containing reference images (e.g., "img", "seg")
+      * -ref_subfolder: Optional subfolder within ref_folder
+      * Searches: patient_dir/visit/ref_folder/(ref_subfolder)/ for -ref identifier
+      * Consistent with how images are loaded - same patient/visit structure
+      * Falls back to recursive search if -ref_folder not specified
+      * -ref can still be a direct path to reference image
+
+IMPORTANT - ANTs Transform Inversion:
+    - Affine transforms (.mat files): CAN be inverted on-the-fly using [transform.mat,1]
+    - Displacement fields (.nii.gz warps): CANNOT be inverted on-the-fly
+      You MUST use the pre-computed 1InverseWarp.nii.gz file generated during registration.
 
 Output Structure:
     TREE mode: {output_dir}/{patient}/{visit}/{regfolder}/{img_folder}/(subfolder)/
-    VENT mode: {output_dir}/{patient}/{visit}/{regfolder}/{vent_folder}/
+    VENT mode: {output_dir}/{patient}/{visit}/{vent_trans_folder}_2_{ref_target}/{vent_folder}/
+               (auto-generated from transformation chain)
     DIRECT mode: {output_dir}/{patient_id}/
+
+Output Files:
+    - {image_name}[suffix].{ext} - The transformed image (suffix/extension configurable)
+    - {image_name}[suffix]_ANTsCall.txt - ANTs command for reproducibility
 """
 
 import os
@@ -61,7 +98,7 @@ logger = logging.getLogger(__name__)
 class TransformMode(Enum):
     """
     Transform application modes.
-    
+
     FORWARD: Apply affine + forward warp (standard registration output)
     INVERSE: Apply inverse affine + inverse warp (reverse the registration)
     WARP_ONLY: Apply only the warp transform (no affine)
@@ -77,7 +114,7 @@ class TransformMode(Enum):
 class TransformFiles:
     """
     Container for transform file paths with explicit control over which to use.
-    
+
     Attributes:
         affine: Path to affine transform file (.mat)
         warp: Path to forward warp file (1Warp.nii.gz)
@@ -85,7 +122,6 @@ class TransformFiles:
         composite: Path to composite transform (if single-file format)
         transform_type: 'standard', 'composite', 'explicit', or 'unknown'
         user_specified: Whether files were explicitly specified by user
-        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
     """
     affine: Optional[str] = None
     warp: Optional[str] = None
@@ -93,27 +129,26 @@ class TransformFiles:
     composite: Optional[str] = None
     transform_type: str = "unknown"
     user_specified: bool = False
-    inverse_use_ants: bool = False
-    
+
     @classmethod
-    def from_explicit_files(cls, transform_dir: str, 
+    def from_explicit_files(cls, transform_dir: str,
                            affine_file: Optional[str] = None,
                            warp_file: Optional[str] = None,
                            inverse_warp_file: Optional[str] = None) -> 'TransformFiles':
         """
         Create TransformFiles from explicitly specified filenames.
-        
+
         Args:
             transform_dir: Base directory for relative paths
             affine_file: Affine transform filename (relative or absolute)
             warp_file: Warp transform filename (relative or absolute)
             inverse_warp_file: Inverse warp transform filename (relative or absolute)
-        
+
         Returns:
             TransformFiles instance with specified files
         """
         instance = cls(user_specified=True)
-        
+
         def resolve_path(filename: Optional[str]) -> Optional[str]:
             """Resolve filename to full path, checking existence."""
             if filename is None:
@@ -132,11 +167,11 @@ class TransformFiles:
             else:
                 logger.warning(f"Specified file not found: {full_path}")
                 return None
-        
+
         instance.affine = resolve_path(affine_file)
         instance.warp = resolve_path(warp_file)
         instance.inverse_warp = resolve_path(inverse_warp_file)
-        
+
         # Determine transform type based on what was provided
         if instance.warp and instance.affine:
             instance.transform_type = 'explicit'
@@ -159,36 +194,36 @@ class TransformFiles:
         else:
             instance.transform_type = 'unknown'
             logger.warning("No valid transform files found from explicit specification")
-        
+
         return instance
-    
+
     def has_forward_transforms(self) -> bool:
         """Check if forward transforms are available."""
         if self.transform_type == 'composite':
             return self.composite is not None
         return self.warp is not None
-    
+
     def has_inverse_transforms(self) -> bool:
         """Check if inverse transforms are available."""
         if self.transform_type == 'composite':
             # Composite transforms can be inverted via ANTs flag
             return self.composite is not None
         return self.inverse_warp is not None
-    
+
     def get_transforms_for_mode(self, mode: TransformMode) -> List[Dict[str, str]]:
         """
         Get the transform specifications for a given mode.
-        
+
         Returns list of dicts with 'path' and 'invert' keys.
         ANTs applies transforms in reverse order (last specified is applied first).
         For forward: warp is applied first, then affine (so specify: warp, affine)
         For inverse: inverse_affine first, then inverse_warp (so specify: inverse_warp, affine[inverted])
-        
+
         Returns:
             List of transform specifications: [{'path': str, 'invert': bool}, ...]
         """
         transforms = []
-        
+
         if mode == TransformMode.FORWARD:
             if self.transform_type == 'composite':
                 if self.composite:
@@ -199,7 +234,7 @@ class TransformFiles:
                     transforms.append({'path': self.warp, 'invert': False})
                 if self.affine:
                     transforms.append({'path': self.affine, 'invert': False})
-                    
+
         elif mode == TransformMode.INVERSE:
             if self.transform_type == 'composite':
                 if self.composite:
@@ -211,31 +246,27 @@ class TransformFiles:
                 # So we specify: affine[inverted] first, then inverse_warp second
                 # This produces: -t [Affine.mat,1] -t InverseWarp.nii.gz
                 # ANTs will apply InverseWarp first, then inverted Affine second
+                #
+                # NOTE: ANTs can only invert affine transforms on-the-fly using [transform,1]
+                # Displacement fields (warps) CANNOT be inverted on-the-fly - must use pre-computed inverse
+                
                 if self.affine:
                     transforms.append({'path': self.affine, 'invert': True})
-                
-                # Handle warp inversion - either use inverse warp file or ANTs inversion flag
-                if self.inverse_use_ants:
-                    # Force using forward warp with ANTs inversion flag
-                    if self.warp:
-                        logger.info("Using forward warp with ANTs inversion flag (inverse_use_ants=True)")
-                        transforms.append({'path': self.warp, 'invert': True})
-                    else:
-                        logger.warning("inverse_use_ants=True but no forward warp found")
-                elif self.inverse_warp:
+
+                # Must use pre-computed inverse warp (ANTs cannot invert displacement fields on-the-fly)
+                if self.inverse_warp:
                     transforms.append({'path': self.inverse_warp, 'invert': False})
-                elif self.warp:
-                    # Fallback: invert the forward warp if no inverse available
-                    logger.warning("No inverse warp found, using forward warp with inversion flag")
-                    transforms.append({'path': self.warp, 'invert': True})
-                    
+                else:
+                    logger.error("No inverse warp found! ANTs cannot invert displacement fields on-the-fly.")
+                    logger.error("Please ensure the registration produced a 1InverseWarp.nii.gz file.")
+
         elif mode == TransformMode.WARP_ONLY:
             if self.transform_type == 'composite':
                 if self.composite:
                     transforms.append({'path': self.composite, 'invert': False})
             elif self.warp:
                 transforms.append({'path': self.warp, 'invert': False})
-                
+
         elif mode == TransformMode.INVERSE_WARP_ONLY:
             if self.transform_type == 'composite':
                 if self.composite:
@@ -245,13 +276,13 @@ class TransformFiles:
             elif self.warp:
                 logger.warning("No inverse warp found, using forward warp with inversion flag")
                 transforms.append({'path': self.warp, 'invert': True})
-        
+
         return transforms
-    
+
     def validate_mode(self, mode: TransformMode) -> tuple[bool, str]:
         """
         Validate that the required transforms exist for the given mode.
-        
+
         Returns:
             Tuple of (is_valid, error_message)
         """
@@ -263,7 +294,7 @@ class TransformFiles:
                 if not self.warp:
                     return False, "Forward warp file not found"
             return True, ""
-            
+
         elif mode == TransformMode.INVERSE:
             if self.transform_type == 'composite':
                 if not self.composite:
@@ -272,7 +303,7 @@ class TransformFiles:
                 if not self.inverse_warp and not self.warp:
                     return False, "Neither inverse warp nor forward warp found for inverse mode"
             return True, ""
-            
+
         elif mode == TransformMode.WARP_ONLY:
             if self.transform_type == 'composite':
                 if not self.composite:
@@ -280,7 +311,7 @@ class TransformFiles:
             elif not self.warp:
                 return False, "Warp file not found for warp_only mode"
             return True, ""
-            
+
         elif mode == TransformMode.INVERSE_WARP_ONLY:
             if self.transform_type == 'composite':
                 if not self.composite:
@@ -288,9 +319,9 @@ class TransformFiles:
             elif not self.inverse_warp and not self.warp:
                 return False, "Neither inverse warp nor forward warp found for inverse_warp_only mode"
             return True, ""
-        
+
         return False, f"Unknown transform mode: {mode}"
-    
+
     def __str__(self) -> str:
         """String representation showing available transforms."""
         parts = [f"TransformFiles(type={self.transform_type}"]
@@ -314,48 +345,51 @@ manual = False  # Set to True when running in IDE
 manual_params = {
     # Mode selection: 'direct', 'tree', or 'vent'
     'mode': 'tree',
-    
+
     # NEW: Transform mode selection
     'transform_mode': 'forward',  # 'forward', 'inverse', 'warp_only', 'inverse_warp_only'
-    
+
     # NEW: Explicit transform file specification (optional - overrides auto-detection)
     # If None, auto-detection is used. Paths can be relative to transform folder or absolute.
     'affine_file': None,         # e.g., 'Reg__TLC_2__RV_0GenericAffine.mat'
     'warp_file': None,           # e.g., 'Reg__TLC_2__RV_1Warp.nii.gz'
     'inverse_warp_file': None,   # e.g., 'Reg__TLC_2__RV_1InverseWarp.nii.gz'
-    'inverse_use_ants': False,   # If True, use forward warp with ANTs inversion flag instead of inverse warp file
-    
+
+    # Interpolation override (None = auto-detect based on filename)
+    # Options: 'Linear', 'NearestNeighbor', 'BSpline', 'Gaussian', 'GenericLabel'
+    'interpolation': None,
+
     # Common parameters
-    'patient_dir': r'/path',
-    'ants_path': r'/path', #Use None if you want to use antspy
+    'patient_dir': r'X:/polaris2/shared/will/MMAVIC/MMAVIC_2/MMAVIC_001',
+    'ants_path': r'/usr/local/community/polaris/tools/ants/2.5.1/bin/',
     'dimensions': '3',
-    
+
     # Transform location parameters
     'transform_folder': 'Reg__TLC_2__RV',  # Name of registration folder within patient tree
     'timepoint': None,  # Specific timepoint, or None to auto-detect
-    
+
     # For DIRECT mode
     'direct_image': None,  # Full path to single image to transform
     'direct_transform_dir': None,  # Full path to directory containing transforms
     'direct_reference': None,  # Full path to reference image
     'direct_output': None,  # Full path to output file
     'patient_id': None,  # Patient identifier for direct mode output structure
-    
+
     # For TREE mode
     'img_folder': 'img',  # Folder name containing images
     'sub_folder': None,  # Optional subfolder within img_folder
     'reference_identifier': 'RV',  # String to identify reference image in tree
-    
+
     # For VENT mode (images within registration folder)
     'vent_dir': None,  # Ventilation patient directory (if different from patient_dir)
     'vent_transform_folder': None,  # Ventilation registration folder
     'vent_dirs': ['Vent_Int', 'Vent_Trans', 'Vent_Hyb3'],  # Ventilation type folders
     'vent_strings': {'Vent_Int': 'sVent', 'Vent_Trans': 'JacVent', 'Vent_Hyb3': 'HYCID'},
     'vent_img_filters': ['_medfilt_3.nii.gz'],  # Filters for vent images
-    
+
     # Output settings
     'output_dir': None,  # Base output directory (None = save in transform folder)
-    
+
     # Image filtering
     'include_images': None,  # List of identifiers to include
     'exclude_images': ['mask', 'seg'],  # List of identifiers to exclude
@@ -364,10 +398,10 @@ manual_params = {
 # Default ventilation directories and strings (backward compatibility)
 DEFAULT_VENT_DIRS = ["Vent_Int", "Vent_Trans", "Vent_Hyb", "Vent_Hyb2", "Vent_Hyb3"]
 DEFAULT_VENT_STRINGS = {
-    'Vent_Int': 'sVent', 
-    'Vent_Trans': 'JacVent', 
-    'Vent_Hyb': 'SIJacVent', 
-    'Vent_Hyb2': 'SqSIJacVent', 
+    'Vent_Int': 'sVent',
+    'Vent_Trans': 'JacVent',
+    'Vent_Hyb': 'SIJacVent',
+    'Vent_Hyb2': 'SqSIJacVent',
     'Vent_Hyb3': 'HYCID'
 }
 
@@ -387,11 +421,11 @@ def load_img_dir(load_dir):
 def load_folder(fdir, dirs_to_find=False):
     """
     Load folder's subdirectories.
-    
+
     Args:
         fdir: Directory to search in
         dirs_to_find: Specific directories to look for (string, list, or False for all)
-    
+
     Returns:
         numpy array of directory names found
     """
@@ -432,15 +466,15 @@ def load_folder(fdir, dirs_to_find=False):
     return np.array(existing_dirs)
 
 
-def load_folder_imgs(fdir, files_to_find=False, extensions=('.nii', '.nii.gz', '.mha')):
+def load_folder_imgs(fdir, files_to_find=False, extensions=('.nii', '.nii.gz', '.mha', '.mhd', '.nrrd')):
     """
     Find image files in a directory matching specified substring patterns.
-    
+
     Args:
         fdir: Directory to search
         files_to_find: Specific file patterns to match (string, list, or False for all)
         extensions: Valid file extensions
-    
+
     Returns:
         numpy array of matching filenames
     """
@@ -462,7 +496,7 @@ def load_folder_imgs(fdir, files_to_find=False, extensions=('.nii', '.nii.gz', '
         matching_files = []
         for pattern in patterns_list:
             pattern_matches = glob.glob(os.path.join(fdir, f"*{pattern}*"))
-            pattern_matches = [os.path.basename(f) for f in pattern_matches 
+            pattern_matches = [os.path.basename(f) for f in pattern_matches
                              if f.endswith(extensions)]
             matching_files.extend(pattern_matches)
 
@@ -486,62 +520,62 @@ def load_tree_structure(source_dir, folder, subfolder=None, timepoint=None, file
     """
     Load images from nested patient directory structure.
     Matches the pattern: source_dir / timepoint / folder / (subfolder) / images
-    
+
     Args:
         source_dir: Patient directory (e.g., /data/Patient01)
         folder: Folder name to load from each timepoint (e.g., 'img', 'Images')
         subfolder: Optional subfolder within the specified folder
         timepoint: Specific timepoint(s) to load (None = auto-detect all)
         filenames: Specific filename patterns to search for
-    
+
     Returns:
         DataFrame with columns: Images, Directory, Timepoint, Folder, Subfolder
     """
     Table_out = pd.DataFrame()
-    
+
     logger.info("Loading Directory Tree...")
     logger.info(f"  Source directory: {source_dir}")
     logger.info(f"  Folder: {folder}")
     logger.info(f"  Subfolder: {subfolder}")
     logger.info(f"  Timepoint(s): {timepoint if timepoint else 'auto-detect'}")
-    
+
     # Get timepoints
     timepoints = load_folder(fdir=source_dir, dirs_to_find=timepoint)
-    
+
     if timepoints is None or len(timepoints) == 0:
         logger.warning(f"No timepoints found in {source_dir}")
         return Table_out
-    
+
     for tp in timepoints:
         logger.debug(f"Processing timepoint: {tp}")
         time_point_path = os.path.join(source_dir, tp)
-        
+
         # Look for the specified folder
         folders = load_folder(fdir=time_point_path, dirs_to_find=folder)
-        
+
         if folders is None or len(folders) == 0:
             logger.debug(f"Folder '{folder}' not found in timepoint {tp}")
             continue
-        
+
         for fld in folders:
             folder_path = os.path.join(time_point_path, fld)
-            
+
             if subfolder:
                 # Look for subfolder
                 subfolders = load_folder(fdir=folder_path, dirs_to_find=subfolder)
-                
+
                 if subfolders is None or len(subfolders) == 0:
                     logger.debug(f"Subfolder '{subfolder}' not found in {folder_path}")
                     continue
-                
+
                 for sf in subfolders:
                     data_folder = os.path.join(folder_path, sf)
                     imgs = load_folder_imgs(fdir=data_folder, files_to_find=filenames)
-                    
+
                     if imgs is None or len(imgs) == 0:
                         logger.debug(f"No images in {data_folder}")
                         imgs = np.array(["None"])
-                    
+
                     data_to_bind = {
                         'Images': [imgs],
                         'Directory': [data_folder],
@@ -554,11 +588,11 @@ def load_tree_structure(source_dir, folder, subfolder=None, timepoint=None, file
                 # No subfolder, load directly from folder
                 data_folder = folder_path
                 imgs = load_folder_imgs(fdir=data_folder, files_to_find=filenames)
-                
+
                 if imgs is None or len(imgs) == 0:
                     logger.debug(f"No images in {data_folder}")
                     imgs = np.array(["None"])
-                
+
                 data_to_bind = {
                     'Images': [imgs],
                     'Directory': [data_folder],
@@ -567,17 +601,17 @@ def load_tree_structure(source_dir, folder, subfolder=None, timepoint=None, file
                     'Subfolder': [None]
                 }
                 Table_out = pd.concat([Table_out, pd.DataFrame(data_to_bind)], ignore_index=True)
-    
+
     logger.info(f"  Found {len(Table_out)} directories with images")
     return Table_out
 
 
-def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None, 
+def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
                        vent_strings=None, vent_filters=None):
     """
     Load ventilation images from within registration folder structure.
     Pattern: source_dir / timepoint / reg_folder / vent_dir / images
-    
+
     Args:
         source_dir: Patient directory (e.g., /data/Patient01)
         reg_folder: Registration folder name (e.g., 'Reg__TLC_2__RV')
@@ -585,7 +619,7 @@ def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
         vent_dirs: List of ventilation type folders (e.g., ['Vent_Int', 'Vent_Trans'])
         vent_strings: Dict mapping vent folder to image prefix (e.g., {'Vent_Int': 'sVent'})
         vent_filters: Additional filename filters (e.g., ['_medfilt_3.nii.gz'])
-    
+
     Returns:
         DataFrame with columns: Images, Directory, Timepoint, VentType, RegFolder
     """
@@ -593,31 +627,31 @@ def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
         vent_dirs = DEFAULT_VENT_DIRS
     if vent_strings is None:
         vent_strings = DEFAULT_VENT_STRINGS
-    
+
     Table_out = pd.DataFrame()
-    
+
     logger.info("Loading Ventilation Directory Structure...")
     logger.info(f"  Source directory: {source_dir}")
     logger.info(f"  Registration folder: {reg_folder}")
     logger.info(f"  Vent directories: {vent_dirs}")
     logger.info(f"  Vent strings: {vent_strings}")
     logger.info(f"  Vent filters: {vent_filters}")
-    
+
     # Get timepoints
     timepoints = load_folder(fdir=source_dir, dirs_to_find=timepoint)
-    
+
     if timepoints is None or len(timepoints) == 0:
         logger.warning(f"No timepoints found in {source_dir}")
         return Table_out
-    
+
     for tp in timepoints:
         logger.debug(f"Processing timepoint: {tp}")
         time_point_path = os.path.join(source_dir, tp)
-        
+
         # Find registration folder
         reg_path = os.path.join(time_point_path, reg_folder)
         actual_reg_folder = reg_folder  # Track actual folder name used
-        
+
         if not os.path.exists(reg_path):
             # Try finding it with pattern matching
             matching_dirs = glob.glob(os.path.join(time_point_path, f"*{reg_folder}*"))
@@ -628,18 +662,18 @@ def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
             else:
                 logger.debug(f"Registration folder not found in {time_point_path}")
                 continue
-        
+
         # Look for ventilation directories within registration folder
         for vent_dir in vent_dirs:
             vent_path = os.path.join(reg_path, vent_dir)
-            
+
             if not os.path.exists(vent_path):
                 logger.debug(f"Vent directory '{vent_dir}' not found in {reg_path}")
                 continue
-            
+
             # Get the expected image prefix
             vent_prefix = vent_strings.get(vent_dir, None)
-            
+
             # Build search pattern
             search_patterns = []
             if vent_prefix:
@@ -650,17 +684,17 @@ def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
                     search_patterns.append(vent_prefix)
             elif vent_filters:
                 search_patterns = vent_filters
-            
+
             # Find images
             if search_patterns:
                 imgs = load_folder_imgs(fdir=vent_path, files_to_find=search_patterns)
             else:
                 imgs = load_folder_imgs(fdir=vent_path)
-            
+
             if imgs is None or len(imgs) == 0:
                 logger.debug(f"No matching images in {vent_path}")
                 imgs = np.array(["None"])
-            
+
             data_to_bind = {
                 'Images': [imgs],
                 'Directory': [vent_path],
@@ -669,79 +703,75 @@ def load_vent_structure(source_dir, reg_folder, timepoint=None, vent_dirs=None,
                 'RegFolder': [actual_reg_folder]
             }
             Table_out = pd.concat([Table_out, pd.DataFrame(data_to_bind)], ignore_index=True)
-    
+
     logger.info(f"  Found {len(Table_out)} ventilation directories with images")
     return Table_out
 
 
 #%% Transform Finding Functions (Updated for TransformFiles dataclass)
 
-def find_transform_files(transform_dir, affine_file=None, warp_file=None, 
-                        inverse_warp_file=None, inverse_use_ants=False) -> TransformFiles:
+def find_transform_files(transform_dir, affine_file=None, warp_file=None,
+                        inverse_warp_file=None) -> TransformFiles:
     """
     Find and identify transform files in a directory.
-    
+
     If explicit filenames are provided, uses those instead of auto-detection.
-    
+
     Args:
         transform_dir: Directory containing transform files
         affine_file: Optional explicit affine filename (relative or absolute)
         warp_file: Optional explicit warp filename (relative or absolute)
         inverse_warp_file: Optional explicit inverse warp filename (relative or absolute)
-        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
-    
+
     Returns:
         TransformFiles: Dataclass with all found transform file paths
     """
     # Check if any explicit files were specified
     has_explicit = any([affine_file, warp_file, inverse_warp_file])
-    
+
     if has_explicit:
         logger.info("Using explicitly specified transform files")
-        result = TransformFiles.from_explicit_files(
-            transform_dir, 
+        return TransformFiles.from_explicit_files(
+            transform_dir,
             affine_file=affine_file,
             warp_file=warp_file,
             inverse_warp_file=inverse_warp_file
         )
-        result.inverse_use_ants = inverse_use_ants
-        return result
-    
+
     # Auto-detection mode
     transforms = TransformFiles()
-    transforms.inverse_use_ants = inverse_use_ants
-    
+
     if not os.path.exists(transform_dir):
         logger.error(f"Transform directory does not exist: {transform_dir}")
         return transforms
-    
+
     # Check for composite transform (single file)
     composite_files = glob.glob(os.path.join(transform_dir, "*composite*1Warp.nii.gz"))
     # Also check for Composite.h5 format
     composite_h5_files = glob.glob(os.path.join(transform_dir, "*Composite.h5"))
-    
+
     # Check for standard transform files
     warp_files = glob.glob(os.path.join(transform_dir, "*1Warp.nii.gz"))
     inv_warp_files = glob.glob(os.path.join(transform_dir, "*1InverseWarp.nii.gz"))
     affine_files = glob.glob(os.path.join(transform_dir, "*0GenericAffine.mat"))
-    
+
     # Exclude composite files from warp files
     warp_files = [w for w in warp_files if "composite" not in w.lower() and "Inverse" not in w]
-    
+
     if composite_files or composite_h5_files:
         transforms.transform_type = 'composite'
         transforms.composite = composite_files[0] if composite_files else composite_h5_files[0]
         logger.info(f"Found composite transform: {transforms.composite}")
-        
+
     elif warp_files:
         transforms.transform_type = 'standard'
         transforms.warp = warp_files[0]
         logger.info(f"Found forward warp: {transforms.warp}")
-        
+
         if affine_files:
             transforms.affine = affine_files[0]
             logger.info(f"Found affine: {transforms.affine}")
-            
+
         if inv_warp_files:
             transforms.inverse_warp = inv_warp_files[0]
             logger.info(f"Found inverse warp: {transforms.inverse_warp}")
@@ -752,20 +782,16 @@ def find_transform_files(transform_dir, affine_file=None, warp_file=None,
         # Still try to capture any transforms found
         if affine_files:
             transforms.affine = affine_files[0]
-    
-    if inverse_use_ants:
-        logger.info("inverse_use_ants=True: Will use forward warp with ANTs inversion flag for inverse transforms")
-    
+
     return transforms
 
 
 def find_transform_in_tree(patient_dir, reg_folder, timepoint=None,
-                          affine_file=None, warp_file=None, inverse_warp_file=None,
-                          inverse_use_ants=False):
+                          affine_file=None, warp_file=None, inverse_warp_file=None):
     """
     Find transform files within a tree structure.
     Pattern: patient_dir / timepoint / reg_folder / transforms
-    
+
     Args:
         patient_dir: Patient directory
         reg_folder: Registration folder name or pattern
@@ -773,29 +799,28 @@ def find_transform_in_tree(patient_dir, reg_folder, timepoint=None,
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
-        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
-    
+
     Returns:
         tuple: (transform_dir, TransformFiles, actual_reg_folder_name, timepoint_used)
     """
     logger.info("Searching for transforms in tree structure...")
     logger.info(f"  Patient dir: {patient_dir}")
     logger.info(f"  Reg folder pattern: {reg_folder}")
-    
+
     # Get timepoints
     timepoints = load_folder(fdir=patient_dir, dirs_to_find=timepoint)
-    
+
     if timepoints is None or len(timepoints) == 0:
         logger.error(f"No timepoints found in {patient_dir}")
         return None, None, None, None
-    
+
     for tp in timepoints:
         tp_path = os.path.join(patient_dir, tp)
-        
+
         # Look for registration folder
         reg_path = os.path.join(tp_path, reg_folder)
         actual_reg_folder = reg_folder
-        
+
         if not os.path.exists(reg_path):
             # Try pattern matching
             matching_dirs = glob.glob(os.path.join(tp_path, f"*{reg_folder}*"))
@@ -804,74 +829,286 @@ def find_transform_in_tree(patient_dir, reg_folder, timepoint=None,
                 actual_reg_folder = os.path.basename(reg_path)
             else:
                 continue
-        
+
         # Check for transform files (with optional explicit specification)
         transform_files = find_transform_files(
-            reg_path, 
+            reg_path,
             affine_file=affine_file,
             warp_file=warp_file,
-            inverse_warp_file=inverse_warp_file,
-            inverse_use_ants=inverse_use_ants
+            inverse_warp_file=inverse_warp_file
         )
-        
+
         if transform_files.has_forward_transforms() or transform_files.has_inverse_transforms():
             logger.info(f"Found transforms in: {reg_path}")
             return reg_path, transform_files, actual_reg_folder, tp
-    
+
     logger.error(f"No transform files found in tree structure")
     return None, None, None, None
 
 
-def find_reference_image(reference_identifier, search_dirs, img_folder=None):
+def find_reference_image(reference_identifier, search_dirs=None, img_folder=None):
     """
-    Find reference image with flexible search strategy.
+    Find reference image with flexible search strategy (legacy method).
     
+    This is the fallback method that searches directories recursively.
+    Prefer find_reference_image_tree() for structured tree searches.
+
     Args:
         reference_identifier: Reference image identifier string or full path
         search_dirs: List of directories to search
         img_folder: Optional folder name to restrict search
-    
+
     Returns:
         str: Full path to reference image, or None if not found
     """
     logger.info(f"Searching for reference image: {reference_identifier}")
-    
+
     # Check if it's already a full path
     if os.path.exists(reference_identifier):
         logger.info(f"  Found (full path): {reference_identifier}")
         return reference_identifier
-    
+
+    if not search_dirs:
+        logger.error(f"No search directories provided for reference image")
+        return None
+
     # Search in provided directories
     for search_dir in search_dirs:
         if not search_dir or not os.path.exists(search_dir):
             continue
-        
+
         logger.debug(f"  Searching in: {search_dir}")
-        
+
         # Walk through directory tree
         for root, dirs, files in os.walk(search_dir):
             # If img_folder specified, only search in matching folders
             if img_folder and img_folder not in root:
                 continue
-            
+
             for f in files:
-                if reference_identifier in f and f.endswith(('.nii', '.nii.gz', '.mha')):
+                if reference_identifier in f and f.endswith(('.nii', '.nii.gz', '.mha', '.mhd', '.nrrd')):
                     ref_path = os.path.join(root, f)
                     logger.info(f"  Found: {ref_path}")
                     return ref_path
-    
+
     logger.error(f"Reference image not found: {reference_identifier}")
+    return None
+
+
+def find_reference_image_tree(patient_dir, reference_identifier, ref_folder, 
+                               timepoint=None, ref_subfolder=None):
+    """
+    Find reference image using structured tree search.
+    
+    Follows the pattern: patient_dir/visit/ref_folder/(ref_subfolder)/files
+    
+    This is consistent with how images are loaded in tree mode, ensuring
+    the reference comes from the same timepoint as the images being processed.
+
+    Args:
+        patient_dir: Patient directory (e.g., /data/Patient01)
+        reference_identifier: Reference image identifier string (e.g., "RV", "_TLC")
+                             Can also be a full path (returned directly if exists)
+        ref_folder: Folder name containing reference images (e.g., "img", "seg")
+        timepoint: Specific timepoint(s) to search (None = search all timepoints)
+        ref_subfolder: Optional subfolder within ref_folder
+
+    Returns:
+        str: Full path to reference image, or None if not found
+    """
+    logger.info(f"Searching for reference image (tree mode):")
+    logger.info(f"  Patient dir: {patient_dir}")
+    logger.info(f"  Reference identifier: {reference_identifier}")
+    logger.info(f"  Reference folder: {ref_folder}")
+    logger.info(f"  Timepoint: {timepoint if timepoint else 'auto-detect'}")
+    logger.info(f"  Reference subfolder: {ref_subfolder if ref_subfolder else 'None'}")
+
+    # Check if it's already a full path
+    if reference_identifier and os.path.exists(reference_identifier):
+        logger.info(f"  Found (full path): {reference_identifier}")
+        return reference_identifier
+
+    if not patient_dir or not os.path.exists(patient_dir):
+        logger.error(f"Patient directory does not exist: {patient_dir}")
+        return None
+
+    if not ref_folder:
+        logger.error("Reference folder (-ref_folder) not specified")
+        return None
+
+    # Get timepoints using same logic as main image loading
+    timepoints = load_folder(fdir=patient_dir, dirs_to_find=timepoint)
+
+    if timepoints is None or len(timepoints) == 0:
+        logger.warning(f"No timepoints found in {patient_dir}")
+        return None
+
+    # Search in each timepoint
+    for tp in timepoints:
+        tp_path = os.path.join(patient_dir, tp)
+        
+        # Look for ref_folder
+        ref_folder_path = os.path.join(tp_path, ref_folder)
+        
+        if not os.path.exists(ref_folder_path):
+            # Try pattern matching
+            matching_dirs = glob.glob(os.path.join(tp_path, f"*{ref_folder}*"))
+            if matching_dirs:
+                ref_folder_path = matching_dirs[0]
+                logger.debug(f"  Found ref folder via pattern: {ref_folder_path}")
+            else:
+                logger.debug(f"  Ref folder '{ref_folder}' not found in {tp_path}")
+                continue
+
+        # Determine search path (with or without subfolder)
+        if ref_subfolder:
+            search_path = os.path.join(ref_folder_path, ref_subfolder)
+            if not os.path.exists(search_path):
+                # Try pattern matching for subfolder
+                matching_subs = glob.glob(os.path.join(ref_folder_path, f"*{ref_subfolder}*"))
+                if matching_subs:
+                    search_path = matching_subs[0]
+                else:
+                    logger.debug(f"  Subfolder '{ref_subfolder}' not found in {ref_folder_path}")
+                    continue
+        else:
+            search_path = ref_folder_path
+
+        if not os.path.exists(search_path):
+            continue
+
+        # Search for reference image in this location
+        logger.debug(f"  Searching in: {search_path}")
+        
+        for f in os.listdir(search_path):
+            if reference_identifier in f and f.endswith(('.nii', '.nii.gz', '.mha', '.mhd', '.nrrd')):
+                ref_path = os.path.join(search_path, f)
+                logger.info(f"  Found: {ref_path}")
+                return ref_path
+
+    logger.error(f"Reference image not found: {reference_identifier}")
+    return None
+
+
+def find_reference_for_timepoint(patient_dir, reference_identifier, ref_folder,
+                                  specific_timepoint, ref_subfolder=None):
+    """
+    Find reference image for a specific timepoint.
+    
+    This is used when processing multiple timepoints to ensure each
+    gets its corresponding reference image.
+
+    Args:
+        patient_dir: Patient directory
+        reference_identifier: Reference image identifier string or full path
+        ref_folder: Folder name containing reference images
+        specific_timepoint: The specific timepoint to search in
+        ref_subfolder: Optional subfolder within ref_folder
+
+    Returns:
+        str: Full path to reference image, or None if not found
+    """
+    # Check if it's already a full path
+    if reference_identifier and os.path.exists(reference_identifier):
+        return reference_identifier
+
+    if not ref_folder:
+        # Fall back to searching in the timepoint directory recursively
+        tp_path = os.path.join(patient_dir, specific_timepoint)
+        return find_reference_image(reference_identifier, [tp_path])
+
+    # Build path: patient_dir/timepoint/ref_folder/(ref_subfolder)
+    tp_path = os.path.join(patient_dir, specific_timepoint)
+    ref_folder_path = os.path.join(tp_path, ref_folder)
+
+    if not os.path.exists(ref_folder_path):
+        # Try pattern matching
+        matching_dirs = glob.glob(os.path.join(tp_path, f"*{ref_folder}*"))
+        if matching_dirs:
+            ref_folder_path = matching_dirs[0]
+        else:
+            return None
+
+    # Determine search path
+    if ref_subfolder:
+        search_path = os.path.join(ref_folder_path, ref_subfolder)
+        if not os.path.exists(search_path):
+            matching_subs = glob.glob(os.path.join(ref_folder_path, f"*{ref_subfolder}*"))
+            if matching_subs:
+                search_path = matching_subs[0]
+            else:
+                return None
+    else:
+        search_path = ref_folder_path
+
+    if not os.path.exists(search_path):
+        return None
+
+    # Search for reference image
+    for f in os.listdir(search_path):
+        if reference_identifier in f and f.endswith(('.nii', '.nii.gz', '.mha', '.mhd', '.nrrd')):
+            return os.path.join(search_path, f)
+
     return None
 
 
 #%% Transform Application Function (Updated for TransformMode)
 
-def apply_transform_to_image(image_path, output_path, transform_files: TransformFiles, 
+def format_ants_command(cmd_list):
+    """
+    Format ANTs command list as a string suitable for direct execution.
+
+    Joins command list elements with spaces, properly handling paths with spaces
+    and bracket notation for inverted transforms.
+
+    Args:
+        cmd_list: List of command elements
+
+    Returns:
+        str: Formatted command string ready for terminal execution
+    """
+    # Simply join with spaces - the command list should already be properly formatted
+    return ' '.join(cmd_list)
+
+
+def format_ants_command_multiline(cmd_list):
+    """
+    Format ANTs command as a multi-line string with backslash continuation.
+
+    This format is easier to read and edit, suitable for HPC scripts.
+
+    Args:
+        cmd_list: List of command elements
+
+    Returns:
+        str: Formatted multi-line command string
+    """
+    lines = []
+    i = 0
+    while i < len(cmd_list):
+        element = cmd_list[i]
+        # Check if this is a flag (starts with -)
+        if element.startswith('-') and i + 1 < len(cmd_list) and not cmd_list[i + 1].startswith('-'):
+            # Pair the flag with its value
+            lines.append(f"  {element} {cmd_list[i + 1]} \\")
+            i += 2
+        else:
+            lines.append(f"  {element} \\")
+            i += 1
+
+    # Remove trailing backslash from last line
+    if lines:
+        lines[-1] = lines[-1].rstrip(' \\')
+
+    return '\n'.join(lines)
+
+
+def apply_transform_to_image(image_path, output_path, transform_files: TransformFiles,
                             reference_image, transform_mode: TransformMode = TransformMode.FORWARD,
                             ants_path=None, dimensions="3", interpolation="Linear"):
     """
     Apply transform to a single image using ANTs.
-    
+
     Args:
         image_path: Path to input image
         output_path: Path to output transformed image
@@ -881,7 +1118,7 @@ def apply_transform_to_image(image_path, output_path, transform_files: Transform
         ants_path: Path to ANTs binaries
         dimensions: Image dimensions (2 or 3)
         interpolation: Interpolation method (Linear, NearestNeighbor, etc.)
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
@@ -890,13 +1127,13 @@ def apply_transform_to_image(image_path, output_path, transform_files: Transform
     if not is_valid:
         logger.error(f"Transform mode validation failed: {error_msg}")
         return False
-    
+
     # Set ANTs tool path
     if ants_path:
         ants_apply = os.path.join(ants_path, 'antsApplyTransforms')
     else:
         ants_apply = 'antsApplyTransforms'
-    
+
     # Build the command
     apply_command = [
         ants_apply,
@@ -907,14 +1144,14 @@ def apply_transform_to_image(image_path, output_path, transform_files: Transform
         "-n", interpolation,
         "-o", output_path
     ]
-    
+
     # Get transforms for the specified mode
     transforms = transform_files.get_transforms_for_mode(transform_mode)
-    
+
     if not transforms:
         logger.error(f"No transforms available for mode: {transform_mode.value}")
         return False
-    
+
     # Add transforms to command
     # ANTs syntax: -t [transform,invert_flag] where invert_flag is 0 or 1
     for t in transforms:
@@ -922,14 +1159,49 @@ def apply_transform_to_image(image_path, output_path, transform_files: Transform
             apply_command.extend(["-t", f"[{t['path']},1]"])
         else:
             apply_command.extend(["-t", t['path']])
-    
+
     logger.info(f"Applying transform ({transform_mode.value}) to: {os.path.basename(image_path)}")
     logger.debug(f"Command: {' '.join(apply_command)}")
-    
-    
-    #Output formatted Transform command to .txt file (similar to the main registration script!)
-    
-    
+
+    # Output formatted Transform command to .txt file
+    # Generate command file path based on output image path
+    output_base = output_path.replace('.nii.gz', '').replace('.nii', '').replace('.mha', '')
+    command_txt_path = f"{output_base}_ANTsCall.txt"
+
+    try:
+        with open(command_txt_path, 'w') as f:
+            # Write header with metadata
+            f.write("#!/bin/bash\n")
+            f.write(f"# ANTs Apply Transform Command\n")
+            f.write(f"# Generated by py_Apply_Transforms3.py\n")
+            f.write(f"# Transform mode: {transform_mode.value}\n")
+            f.write(f"# Input image: {image_path}\n")
+            f.write(f"# Reference image: {reference_image}\n")
+            f.write(f"# Output image: {output_path}\n")
+            f.write(f"#\n")
+            f.write(f"# Transforms applied (in ANTs command order):\n")
+            for t in transforms:
+                invert_str = " [INVERTED]" if t['invert'] else ""
+                f.write(f"#   - {os.path.basename(t['path'])}{invert_str}\n")
+            f.write(f"#\n")
+            f.write(f"# Note: ANTs applies transforms in REVERSE order (last = first applied)\n")
+            f.write(f"#\n\n")
+
+            # Write single-line command (can be copy-pasted directly)
+            f.write("# Single-line command:\n")
+            f.write(format_ants_command(apply_command))
+            f.write("\n\n")
+
+            # Write multi-line command (easier to read/edit)
+            f.write("# Multi-line command:\n")
+            f.write(f"{apply_command[0]} \\\n")
+            f.write(format_ants_command_multiline(apply_command[1:]))
+            f.write("\n")
+
+        logger.info(f"  Written ANTs command to: {command_txt_path}")
+    except Exception as e:
+        logger.warning(f"  Could not write command file: {e}")
+
     try:
         result = subprocess.run(apply_command, check=True, capture_output=True, text=True)
         logger.info(f"  Success! Output: {output_path}")
@@ -945,42 +1217,152 @@ def apply_transform_to_image(image_path, output_path, transform_files: Transform
 def filter_images(images, include_list=None, exclude_list=None):
     """
     Filter image list based on include/exclude patterns.
-    
+
     Args:
         images: numpy array or list of image filenames
         include_list: List of patterns to include (None = include all)
         exclude_list: List of patterns to exclude (None = exclude none)
-    
+
     Returns:
         Filtered list of images
     """
     if not isinstance(images, (list, np.ndarray)):
         return images
-    
+
     filtered = []
     for img in images:
         if img == "None":
             continue
-        
+
         # Check include list
         if include_list:
             if not any(pattern in img for pattern in include_list):
                 continue
-        
+
         # Check exclude list
         if exclude_list:
             if any(pattern in img for pattern in exclude_list):
                 continue
-        
+
         filtered.append(img)
-    
+
     return filtered
+
+
+def extract_ref_target(reference_identifier):
+    """
+    Extract the target name from a reference identifier string.
+    
+    Strips leading underscores and returns the clean target name.
+    
+    Args:
+        reference_identifier: Reference string (e.g., "_1H-HeFRC", "RV", "_TLC")
+        
+    Returns:
+        str: Clean target name (e.g., "1H-HeFRC", "RV", "TLC")
+    """
+    if reference_identifier is None:
+        return ""
+    # Strip leading underscores
+    target = reference_identifier.lstrip('_')
+    return target
+
+
+def build_output_reg_folder_vent(vent_reg_folder, reference_identifier):
+    """
+    Build the output registration folder name for VENT mode.
+    
+    Creates a folder name that indicates the transformation chain:
+    {vent_reg_folder}_2_{ref_target}
+    
+    Example: 
+        vent_reg_folder="Reg__TLC_2__RV", reference="_1H-HeFRC"
+        -> "Reg__TLC_2__RV_2_1H-HeFRC"
+    
+    Args:
+        vent_reg_folder: Source registration folder where vent images are stored
+        reference_identifier: Reference image identifier (target of new transform)
+        
+    Returns:
+        str: Output registration folder name
+    """
+    ref_target = extract_ref_target(reference_identifier)
+    if vent_reg_folder and ref_target:
+        return f"{vent_reg_folder}_2_{ref_target}"
+    elif vent_reg_folder:
+        return vent_reg_folder
+    elif ref_target:
+        return f"Transformed_2_{ref_target}"
+    else:
+        return "Transformed"
+
+
+def get_output_filename(input_filename, output_suffix=None, output_filetype=None):
+    """
+    Generate output filename with optional suffix and file type conversion.
+    
+    Args:
+        input_filename: Original input filename (e.g., "sVent_medfilt_3.nii.gz")
+        output_suffix: Suffix to append before extension:
+                      - None or empty: no suffix added
+                      - "True": adds "_transformed"
+                      - Any other string: adds that string (e.g., "_warped")
+        output_filetype: Output file extension:
+                        - None: preserve input extension
+                        - ".nii.gz", ".nii", ".mha", ".mhd", ".nrrd": convert to that type
+    
+    Returns:
+        str: Output filename with suffix and extension applied
+        
+    Example:
+        get_output_filename("sVent.nii.gz", "True", ".mha") -> "sVent_transformed.mha"
+        get_output_filename("sVent.nii.gz", "_warped", None) -> "sVent_warped.nii.gz"
+        get_output_filename("sVent.nii.gz", None, None) -> "sVent.nii.gz"
+    """
+    # Supported extensions (order matters - check .nii.gz before .nii)
+    known_extensions = ['.nii.gz', '.nii', '.mha', '.mhd', '.nrrd']
+    
+    # Find and strip the input extension
+    base_name = input_filename
+    input_ext = None
+    for ext in known_extensions:
+        if input_filename.endswith(ext):
+            base_name = input_filename[:-len(ext)]
+            input_ext = ext
+            break
+    
+    # If no known extension found, try to split at last dot
+    if input_ext is None:
+        if '.' in input_filename:
+            base_name, input_ext = input_filename.rsplit('.', 1)
+            input_ext = '.' + input_ext
+        else:
+            input_ext = '.nii.gz'  # Default fallback
+    
+    # Determine suffix to add
+    if output_suffix is None or output_suffix == "" or output_suffix.lower() == "false":
+        suffix = ""
+    elif output_suffix.lower() == "true":
+        suffix = "_transformed"
+    else:
+        # Use the provided string as suffix
+        # Ensure it starts with underscore for consistency (optional)
+        suffix = output_suffix if output_suffix.startswith('_') else f"_{output_suffix}"
+    
+    # Determine output extension
+    if output_filetype is None or output_filetype == "":
+        out_ext = input_ext
+    else:
+        # Normalize the extension (ensure it starts with dot)
+        out_ext = output_filetype if output_filetype.startswith('.') else f".{output_filetype}"
+    
+    return f"{base_name}{suffix}{out_ext}"
 
 
 def build_output_path_tree(output_dir, patient_name, timepoint, reg_folder, img_folder, subfolder=None):
     """
     Build output path for TREE mode preserving directory structure.
-    
+
     Structure: {output_dir}/{patient}/{timepoint}/{reg_folder}/{img_folder}/(subfolder)/
     """
     if subfolder:
@@ -992,7 +1374,7 @@ def build_output_path_tree(output_dir, patient_name, timepoint, reg_folder, img_
 def build_output_path_vent(output_dir, patient_name, timepoint, reg_folder, vent_folder):
     """
     Build output path for VENT mode preserving directory structure.
-    
+
     Structure: {output_dir}/{patient}/{timepoint}/{reg_folder}/{vent_folder}/
     """
     return os.path.join(output_dir, patient_name, timepoint, reg_folder, vent_folder)
@@ -1001,7 +1383,7 @@ def build_output_path_vent(output_dir, patient_name, timepoint, reg_folder, vent
 def build_output_path_direct(output_dir, patient_id):
     """
     Build output path for DIRECT mode.
-    
+
     Structure: {output_dir}/{patient_id}/
     """
     return os.path.join(output_dir, patient_id) if patient_id else output_dir
@@ -1012,11 +1394,11 @@ def build_output_path_direct(output_dir, patient_id):
 def process_direct_mode(image_path, transform_dir, reference_path, output_path,
                        transform_mode=TransformMode.FORWARD,
                        affine_file=None, warp_file=None, inverse_warp_file=None,
-                       inverse_use_ants=False,
-                       ants_path=None, dimensions="3", patient_id=None, output_dir=None):
+                       ants_path=None, dimensions="3", patient_id=None, output_dir=None,
+                       interpolation=None, output_suffix=None, output_filetype=None):
     """
     Process a single image directly.
-    
+
     Args:
         image_path: Path to image to transform
         transform_dir: Directory containing transforms
@@ -1026,12 +1408,14 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
-        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
         ants_path: Path to ANTs binaries
         dimensions: Image dimensions
         patient_id: Patient ID for output structure
         output_dir: Base output directory
-    
+        interpolation: Override interpolation method (None = auto-detect)
+        output_suffix: Suffix for output filename (None=no suffix, "True"="_transformed", or custom string)
+        output_filetype: Output file extension (None=preserve input, or ".nii.gz", ".mha", etc.)
+
     Returns:
         dict: Processing results
     """
@@ -1044,87 +1428,94 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
     logger.info(f"Transform mode: {transform_mode.value}")
     if any([affine_file, warp_file, inverse_warp_file]):
         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
-    if inverse_use_ants:
-        logger.info(f"inverse_use_ants: {inverse_use_ants}")
+    if interpolation:
+        logger.info(f"Interpolation override: {interpolation}")
+    if output_suffix:
+        logger.info(f"Output suffix: {output_suffix}")
+    if output_filetype:
+        logger.info(f"Output filetype: {output_filetype}")
     logger.info("=" * 70)
-    
+
     results = {'success': 0, 'skipped': 0, 'failed': 0}
-    
+
     # Find transform files (with optional explicit specification)
     transform_files = find_transform_files(
         transform_dir,
         affine_file=affine_file,
         warp_file=warp_file,
-        inverse_warp_file=inverse_warp_file,
-        inverse_use_ants=inverse_use_ants
+        inverse_warp_file=inverse_warp_file
     )
-    
+
     if transform_files.transform_type == 'unknown':
         logger.error("Could not identify transforms!")
         results['failed'] += 1
         return results
-    
+
     # Validate transform mode
     is_valid, error_msg = transform_files.validate_mode(transform_mode)
     if not is_valid:
         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
         results['failed'] += 1
         return results
-    
-    # Determine interpolation
+
+    # Determine interpolation (use override if provided)
     img_name = os.path.basename(image_path).lower()
-    interpolation = "NearestNeighbor" if any(x in img_name for x in ['mask', 'seg', 'label']) else "Linear"
-    
+    if interpolation:
+        interp = interpolation
+    else:
+        interp = "NearestNeighbor" if any(x in img_name for x in ['mask', 'seg', 'label']) else "Linear"
+
     # Determine output path
     if not output_path:
         if output_dir and patient_id:
             out_dir = build_output_path_direct(output_dir, patient_id)
             os.makedirs(out_dir, exist_ok=True)
             base_name = os.path.basename(image_path)
-            output_path = os.path.join(out_dir, base_name.replace('.nii.gz', '_transformed.nii.gz'))
+            output_name = get_output_filename(base_name, output_suffix, output_filetype)
+            output_path = os.path.join(out_dir, output_name)
         else:
             logger.error("No output path specified!")
             results['failed'] += 1
             return results
     else:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     # Apply transform
-    if apply_transform_to_image(image_path, output_path, transform_files, 
-                               reference_path, transform_mode, ants_path, 
-                               dimensions, interpolation):
+    if apply_transform_to_image(image_path, output_path, transform_files,
+                               reference_path, transform_mode, ants_path,
+                               dimensions, interp):
         results['success'] += 1
     else:
         results['failed'] += 1
-    
+
     logger.info("=" * 70)
     logger.info(f"PROCESSING COMPLETE: {results['success']} success, {results['failed']} failed")
     logger.info("=" * 70)
-    
+
     return results
 
 
 def process_tree_mode(patient_dir, img_folder, transform_folder, reference_identifier,
                      transform_mode=TransformMode.FORWARD,
                      affine_file=None, warp_file=None, inverse_warp_file=None,
-                     inverse_use_ants=False,
                      ants_path=None, output_dir=None, subfolder=None, timepoint=None,
-                     include_images=None, exclude_images=None, dimensions="3"):
+                     include_images=None, exclude_images=None, dimensions="3",
+                     interpolation=None, output_suffix=None, output_filetype=None,
+                     ref_folder=None, ref_subfolder=None):
     """
     Process images from a tree directory structure.
-    
+
     Output structure: {output_dir}/{patient}/{timepoint}/{reg_folder}/{img_folder}/(subfolder)/
-    
+
     Args:
         patient_dir: Patient directory
         img_folder: Folder containing images
         transform_folder: Registration folder name
-        reference_identifier: String to identify reference image
+        reference_identifier: String to identify reference image (or full path)
         transform_mode: TransformMode enum for which transforms to apply
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
-        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
         ants_path: Path to ANTs binaries
         output_dir: Output directory (None = save in transform folder)
         subfolder: Optional subfolder within img_folder
@@ -1132,7 +1523,12 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
         include_images: Patterns to include
         exclude_images: Patterns to exclude
         dimensions: Image dimensions
-    
+        interpolation: Override interpolation method (None = auto-detect)
+        output_suffix: Suffix for output filename (None=no suffix, "True"="_transformed", or custom string)
+        output_filetype: Output file extension (None=preserve input, or ".nii.gz", ".mha", etc.)
+        ref_folder: Folder containing reference images (e.g., "img", "seg")
+        ref_subfolder: Optional subfolder within ref_folder
+
     Returns:
         dict: Summary of processing results
     """
@@ -1143,55 +1539,68 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
     logger.info(f"Image folder: {img_folder}")
     logger.info(f"Transform folder: {transform_folder}")
     logger.info(f"Reference identifier: {reference_identifier}")
+    logger.info(f"Reference folder: {ref_folder if ref_folder else 'auto-detect'}")
+    logger.info(f"Reference subfolder: {ref_subfolder if ref_subfolder else 'None'}")
     logger.info(f"Transform mode: {transform_mode.value}")
     if any([affine_file, warp_file, inverse_warp_file]):
         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
-    if inverse_use_ants:
-        logger.info(f"inverse_use_ants: {inverse_use_ants}")
+    if interpolation:
+        logger.info(f"Interpolation override: {interpolation}")
+    if output_suffix:
+        logger.info(f"Output suffix: {output_suffix}")
+    if output_filetype:
+        logger.info(f"Output filetype: {output_filetype}")
     logger.info("=" * 70)
-    
+
     results = {'success': 0, 'skipped': 0, 'failed': 0}
-    
+
     # Extract patient name from path
     patient_name = os.path.basename(patient_dir.rstrip(os.sep))
     logger.info(f"Patient name: {patient_name}")
-    
+
     # Load images from tree structure
     image_df = load_tree_structure(patient_dir, img_folder, subfolder, timepoint)
-    
+
     if image_df.empty:
         logger.error("No images found in tree structure!")
         return results
-    
+
     # Find transforms in tree structure (with optional explicit specification)
     transform_dir, transform_files, actual_reg_folder, tp_used = find_transform_in_tree(
         patient_dir, transform_folder, timepoint,
         affine_file=affine_file,
         warp_file=warp_file,
-        inverse_warp_file=inverse_warp_file,
-        inverse_use_ants=inverse_use_ants
+        inverse_warp_file=inverse_warp_file
     )
-    
+
     if transform_files is None:
         logger.error("No transform files found!")
         return results
-    
+
     # Validate transform mode
     is_valid, error_msg = transform_files.validate_mode(transform_mode)
     if not is_valid:
         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
         return results
-    
-    # Find reference image
-    search_dirs = [patient_dir, transform_dir]
-    reference_path = find_reference_image(reference_identifier, search_dirs, img_folder)
-    
+
+    # Find reference image using appropriate method
+    if ref_folder:
+        # Use structured tree search
+        reference_path = find_reference_image_tree(
+            patient_dir, reference_identifier, ref_folder,
+            timepoint=timepoint, ref_subfolder=ref_subfolder
+        )
+    else:
+        # Fall back to recursive search
+        search_dirs = [patient_dir, transform_dir]
+        reference_path = find_reference_image(reference_identifier, search_dirs, img_folder)
+
     if not reference_path:
         logger.error(f"Reference image not found: {reference_identifier}")
         return results
-    
+
     logger.info(f"Using reference: {reference_path}")
-    
+
     # Process each image
     for idx, row in image_df.iterrows():
         imgs = row['Images']
@@ -1199,17 +1608,17 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
         row_timepoint = row.get('Timepoint', tp_used)
         row_folder = row.get('Folder', img_folder)
         row_subfolder = row.get('Subfolder', None)
-        
+
         if not isinstance(imgs, (list, np.ndarray)):
             continue
-        
+
         # Filter images
         filtered_imgs = filter_images(imgs, include_images, exclude_images)
-        
+
         # Determine output directory for this row
         if output_dir:
             final_output_dir = build_output_path_tree(
-                output_dir, patient_name, row_timepoint, actual_reg_folder, 
+                output_dir, patient_name, row_timepoint, actual_reg_folder,
                 row_folder, row_subfolder
             )
         else:
@@ -1218,68 +1627,74 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
                 final_output_dir = os.path.join(transform_dir, row_folder, row_subfolder)
             else:
                 final_output_dir = os.path.join(transform_dir, row_folder)
-        
+
         os.makedirs(final_output_dir, exist_ok=True)
         logger.info(f"Output directory: {final_output_dir}")
-        
+
         for img in filtered_imgs:
             if img == "None" or reference_identifier in img:
                 results['skipped'] += 1
                 continue
-            
+
             img_path = os.path.join(img_dir, img)
-            
-            # Determine interpolation
-            interpolation = "NearestNeighbor" if any(x in img.lower() for x in ['mask', 'seg', 'label']) else "Linear"
-            
-            # Create output filename with mode suffix for clarity
-            mode_suffix = f"_{transform_mode.value}" if transform_mode != TransformMode.FORWARD else ""
-            output_name = img.replace('.nii.gz', f'{mode_suffix}_transformed.nii.gz')
-            if '.nii.gz' not in output_name and '.nii' in output_name:
-                output_name = output_name.replace('.nii', f'{mode_suffix}_transformed.nii.gz')
-            
+
+            # Determine interpolation (use override if provided)
+            if interpolation:
+                interp = interpolation
+            else:
+                interp = "NearestNeighbor" if any(x in img.lower() for x in ['mask', 'seg', 'label']) else "Linear"
+
+            # Create output filename using helper function
+            output_name = get_output_filename(img, output_suffix, output_filetype)
             output_path = os.path.join(final_output_dir, output_name)
-            
+
             # Apply transform
-            if apply_transform_to_image(img_path, output_path, transform_files, 
-                                       reference_path, transform_mode, ants_path, 
-                                       dimensions, interpolation):
+            if apply_transform_to_image(img_path, output_path, transform_files,
+                                       reference_path, transform_mode, ants_path,
+                                       dimensions, interp):
                 results['success'] += 1
             else:
                 results['failed'] += 1
-    
+
     logger.info("=" * 70)
     logger.info(f"PROCESSING COMPLETE: {results['success']} success, {results['skipped']} skipped, {results['failed']} failed")
     logger.info("=" * 70)
-    
+
     return results
 
 
-def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg_folder, 
+def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg_folder,
                      reference_identifier, transform_mode=TransformMode.FORWARD,
                      affine_file=None, warp_file=None, inverse_warp_file=None,
-                     inverse_use_ants=False,
                      ants_path=None, output_dir=None, timepoint=None,
                      vent_dirs=None, vent_strings=None, vent_filters=None,
-                     include_images=None, exclude_images=None, dimensions="3"):
+                     include_images=None, exclude_images=None, dimensions="3",
+                     interpolation=None, output_suffix=None, output_filetype=None,
+                     ref_folder=None, ref_subfolder=None):
     """
     Process ventilation images within registration folder structure.
+
+    Output structure: {output_dir}/{patient}/{timepoint}/{output_reg_folder}/{vent_folder}/
     
-    Output structure: {output_dir}/{patient}/{timepoint}/{reg_folder}/{vent_folder}/
+    The output registration folder name is auto-generated based on the transformation chain:
+        {vent_reg_folder}_2_{ref_target}
     
+    Example:
+        If vent images are in "Reg__TLC_2__RV" and reference is "_1H-HeFRC",
+        output folder will be "Reg__TLC_2__RV_2_1H-HeFRC"
+
     Args:
         patient_dir: Patient directory
         ventilation_patient_dir: Ventilation patient directory (if different)
-        reg_folder: Registration folder name
-        vent_reg_folder: Ventilation registration folder
-        reference_identifier: String to identify reference image
+        reg_folder: Registration folder name (contains the transforms to apply)
+        vent_reg_folder: Ventilation registration folder (where vent images are stored)
+        reference_identifier: String to identify reference image (used for output folder naming)
         transform_mode: TransformMode enum for which transforms to apply
         affine_file: Optional explicit affine filename
         warp_file: Optional explicit warp filename
         inverse_warp_file: Optional explicit inverse warp filename
-        inverse_use_ants: If True, use forward warp with ANTs inversion flag instead of inverse warp file
         ants_path: Path to ANTs binaries
-        output_dir: Output directory (None = save in transform folder)
+        output_dir: Output base directory (None = output alongside input)
         timepoint: Specific timepoint(s)
         vent_dirs: List of ventilation type folders
         vent_strings: Dict mapping vent folder to image prefix
@@ -1287,7 +1702,12 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
         include_images: Patterns to include
         exclude_images: Patterns to exclude
         dimensions: Image dimensions
-    
+        interpolation: Override interpolation method (None = auto-detect)
+        output_suffix: Suffix for output filename (None=no suffix, "True"="_transformed", or custom string)
+        output_filetype: Output file extension (None=preserve input, or ".nii.gz", ".mha", etc.)
+        ref_folder: Folder containing reference images (e.g., "img", "seg")
+        ref_subfolder: Optional subfolder within ref_folder
+
     Returns:
         dict: Summary of processing results
     """
@@ -1295,75 +1715,89 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
     logger.info("VENT MODE - Process Ventilation Images")
     logger.info("=" * 70)
     logger.info(f"Patient directory: {patient_dir}")
-    logger.info(f"Registration folder: {reg_folder}")
+    logger.info(f"Transform folder (source): {reg_folder}")
+    logger.info(f"Vent registration folder: {vent_reg_folder}")
     logger.info(f"Reference identifier: {reference_identifier}")
+    logger.info(f"Reference folder: {ref_folder if ref_folder else 'auto-detect'}")
+    logger.info(f"Reference subfolder: {ref_subfolder if ref_subfolder else 'None'}")
     logger.info(f"Transform mode: {transform_mode.value}")
     logger.info(f"Vent directories: {vent_dirs}")
     if any([affine_file, warp_file, inverse_warp_file]):
         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
-    if inverse_use_ants:
-        logger.info(f"inverse_use_ants: {inverse_use_ants}")
+    if interpolation:
+        logger.info(f"Interpolation override: {interpolation}")
+    if output_suffix:
+        logger.info(f"Output suffix: {output_suffix}")
+    if output_filetype:
+        logger.info(f"Output filetype: {output_filetype}")
     logger.info("=" * 70)
-    
+
     if vent_dirs is None:
         vent_dirs = DEFAULT_VENT_DIRS
     if vent_strings is None:
         vent_strings = DEFAULT_VENT_STRINGS
-    
+
     results = {'success': 0, 'skipped': 0, 'failed': 0}
-    
+
     # Extract patient name from path
     patient_name = os.path.basename(patient_dir.rstrip(os.sep))
     logger.info(f"Patient name: {patient_name}")
-    
+
     # Load ventilation images
     if not ventilation_patient_dir:
         logger.info("No ventilation image folder specified - using default patient folder...")
         if not vent_reg_folder:
             logger.info("No ventilation-registration folder specified - using default registration folder...")
-            image_df = load_vent_structure(patient_dir, reg_folder, timepoint, 
+            image_df = load_vent_structure(patient_dir, reg_folder, timepoint,
                                        vent_dirs, vent_strings, vent_filters)
         else:
-            image_df = load_vent_structure(patient_dir, vent_reg_folder, timepoint, 
+            image_df = load_vent_structure(patient_dir, vent_reg_folder, timepoint,
                                        vent_dirs, vent_strings, vent_filters)
-    else: 
-        image_df = load_vent_structure(ventilation_patient_dir, vent_reg_folder, timepoint, 
+    else:
+        image_df = load_vent_structure(ventilation_patient_dir, vent_reg_folder, timepoint,
                                    vent_dirs, vent_strings, vent_filters)
-    
+
     if image_df.empty:
         logger.error("No ventilation images found!")
         return results
-    
+
     # Find transforms - they should be in the original patient folder! (differs to vent folder)
     # With optional explicit specification
     transform_dir, transform_files, actual_reg_folder, tp_used = find_transform_in_tree(
         patient_dir, reg_folder, timepoint,
         affine_file=affine_file,
         warp_file=warp_file,
-        inverse_warp_file=inverse_warp_file,
-        inverse_use_ants=inverse_use_ants
+        inverse_warp_file=inverse_warp_file
     )
-    
+
     if transform_files is None:
         logger.error("No transform files found!")
         return results
-    
+
     # Validate transform mode
     is_valid, error_msg = transform_files.validate_mode(transform_mode)
     if not is_valid:
         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
         return results
-    
-    # Find reference image (usually in the registration folder or nearby)
-    search_dirs = [patient_dir, transform_dir]
-    reference_path = find_reference_image(reference_identifier, search_dirs)
-    
+
+    # Find reference image using appropriate method
+    if ref_folder:
+        # Use structured tree search
+        reference_path = find_reference_image_tree(
+            patient_dir, reference_identifier, ref_folder,
+            timepoint=timepoint, ref_subfolder=ref_subfolder
+        )
+    else:
+        # Fall back to recursive search
+        search_dirs = [patient_dir, transform_dir]
+        reference_path = find_reference_image(reference_identifier, search_dirs)
+
     if not reference_path:
         logger.error(f"Reference image not found: {reference_identifier}")
         return results
-    
+
     logger.info(f"Using reference: {reference_path}")
-    
+
     # Process each ventilation image
     for idx, row in image_df.iterrows():
         imgs = row['Images']
@@ -1371,55 +1805,70 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
         row_timepoint = row.get('Timepoint', tp_used)
         vent_type = row.get('VentType', 'unknown')
         row_reg_folder = row.get('RegFolder', actual_reg_folder)
-        
+
         if not isinstance(imgs, (list, np.ndarray)):
             continue
-        
+
         # Filter images
         filtered_imgs = filter_images(imgs, include_images, exclude_images)
-        
+
+        # Generate output registration folder name based on transformation chain
+        # Format: {vent_reg_folder}_2_{ref_target}
+        # e.g., "Reg__TLC_2__RV" + "_1H-HeFRC" -> "Reg__TLC_2__RV_2_1H-HeFRC"
+        output_reg_folder = build_output_reg_folder_vent(
+            vent_reg_folder if vent_reg_folder else row_reg_folder,
+            reference_identifier
+        )
+
         # Determine output directory
         if output_dir:
+            # Use provided output_dir as base with auto-generated reg folder name
             final_output_dir = build_output_path_vent(
-                output_dir, patient_name, row_timepoint, actual_reg_folder, vent_type
+                output_dir, patient_name, row_timepoint, output_reg_folder, vent_type
             )
         else:
-            # Save in same ventilation folder
-            final_output_dir = img_dir
+            # Auto-generate output path based on input structure
+            # Replace the reg folder in the input path with the auto-generated name
+            # Input: {base}/{patient}/{visit}/{vent_reg_folder}/{vent_type}/
+            # Output: {base}/{patient}/{visit}/{output_reg_folder}/{vent_type}/
+            parent_of_vent = os.path.dirname(img_dir)  # {base}/{patient}/{visit}/{vent_reg_folder}
+            parent_of_reg = os.path.dirname(parent_of_vent)  # {base}/{patient}/{visit}
+            final_output_dir = os.path.join(parent_of_reg, output_reg_folder, vent_type)
         
+        logger.info(f"Output registration folder: {output_reg_folder}")
+
         os.makedirs(final_output_dir, exist_ok=True)
         logger.info(f"Output directory: {final_output_dir}")
-        
+
         for img in filtered_imgs:
             if img == "None":
                 results['skipped'] += 1
                 continue
-            
+
             img_path = os.path.join(img_dir, img)
-            
-            # Determine interpolation (ventilation images typically use linear)
-            interpolation = "NearestNeighbor" if any(x in img.lower() for x in ['mask', 'seg', 'label']) else "Linear"
-            
-            # Create output filename with mode suffix for clarity
-            mode_suffix = f"_{transform_mode.value}" if transform_mode != TransformMode.FORWARD else ""
-            output_name = img.replace('.nii.gz', f'{mode_suffix}_transformed.nii.gz')
-            if '.nii.gz' not in output_name and '.nii' in output_name:
-                output_name = output_name.replace('.nii', f'{mode_suffix}_transformed.nii.gz')
-            
+
+            # Determine interpolation (use override if provided, ventilation images typically use linear)
+            if interpolation:
+                interp = interpolation
+            else:
+                interp = "NearestNeighbor" if any(x in img.lower() for x in ['mask', 'seg', 'label']) else "Linear"
+
+            # Create output filename using helper function
+            output_name = get_output_filename(img, output_suffix, output_filetype)
             output_path = os.path.join(final_output_dir, output_name)
-            
+
             # Apply transform
-            if apply_transform_to_image(img_path, output_path, transform_files, 
-                                       reference_path, transform_mode, ants_path, 
-                                       dimensions, interpolation):
+            if apply_transform_to_image(img_path, output_path, transform_files,
+                                       reference_path, transform_mode, ants_path,
+                                       dimensions, interp):
                 results['success'] += 1
             else:
                 results['failed'] += 1
-    
+
     logger.info("=" * 70)
     logger.info(f"PROCESSING COMPLETE: {results['success']} success, {results['skipped']} skipped, {results['failed']} failed")
     logger.info("=" * 70)
-    
+
     return results
 
 
@@ -1440,26 +1889,26 @@ Transform Modes:
 Examples:
   # Forward transform (default)
   python %(prog)s --mode tree -pat_dir /data/Patient01 -trans_folder Reg__TLC_2__RV ...
-  
+
   # Inverse transform
   python %(prog)s --mode tree -pat_dir /data/Patient01 -trans_folder Reg__TLC_2__RV -transform_mode inverse ...
-  
+
   # Warp only (for composite transforms)
   python %(prog)s --mode tree -pat_dir /data/Patient01 -trans_folder Reg__TLC_2__RV -transform_mode warp_only ...
 """
     )
-    
+
     # Required mode argument
     parser.add_argument('--mode', type=str, required=True,
                        choices=['direct', 'tree', 'vent'],
                        help="Processing mode: direct, tree, or vent")
-    
+
     # NEW: Transform mode argument
-    parser.add_argument('-transform_mode', '--transform_mode', type=str, 
+    parser.add_argument('-transform_mode', '--transform_mode', type=str,
                        default='forward',
                        choices=['forward', 'inverse', 'warp_only', 'inverse_warp_only'],
                        help="Transform mode: forward (default), inverse, warp_only, inverse_warp_only")
-    
+
     # NEW: Explicit transform file specification (optional - overrides auto-detection)
     parser.add_argument('-affine_file', '--affine_file', type=str,
                        help="Explicit affine transform filename (relative to transform folder or absolute path)")
@@ -1467,10 +1916,13 @@ Examples:
                        help="Explicit warp transform filename (relative to transform folder or absolute path)")
     parser.add_argument('-inverse_warp_file', '--inverse_warp_file', type=str,
                        help="Explicit inverse warp transform filename (relative to transform folder or absolute path)")
-    parser.add_argument('-inverse_use_ants', '--inverse_use_ants', action='store_true',
-                       default=False,
-                       help="For inverse mode: use forward warp with ANTs inversion flag instead of pre-generated inverse warp file")
-    
+
+    # Interpolation override
+    parser.add_argument('-interp', '--interpolation', type=str,
+                       default=None,
+                       choices=['Linear', 'NearestNeighbor', 'BSpline', 'Gaussian', 'GenericLabel'],
+                       help="Override interpolation method (default: auto-detect based on filename)")
+
     # Common arguments
     parser.add_argument('-pat_dir', '--patient_dir', type=Path,
                        help="Patient directory path")
@@ -1482,7 +1934,7 @@ Examples:
                        help="Output base directory")
     parser.add_argument('-timepoint', '--timepoint', type=str, nargs='*',
                        help="Specific timepoint(s) to process")
-    
+
     # DIRECT mode arguments
     parser.add_argument('--direct_image', type=Path,
                        help="[DIRECT] Full path to image to transform")
@@ -1494,17 +1946,24 @@ Examples:
                        help="[DIRECT] Full path to output file")
     parser.add_argument('-patient_id', '--patient_id', type=str,
                        help="[DIRECT] Patient identifier for output structure")
-    
+
     # TREE mode arguments
     parser.add_argument('-img_folder', '--img_folder', type=str,
                        help="[TREE] Folder name containing images")
     parser.add_argument('-sub_folder', '--sub_folder', type=str,
                        help="[TREE] Optional subfolder within img_folder")
     parser.add_argument('-ref', '--reference', type=str,
-                       help="[TREE/VENT] Reference image identifier")
+                       help="[TREE/VENT] Reference image identifier (or full path)")
     parser.add_argument('-trans_folder', '--transform_folder', type=str,
                        help="[TREE/VENT] Registration folder name")
-    
+
+    # Reference image location arguments (for structured tree search)
+    parser.add_argument('-ref_folder', '--ref_folder', type=str,
+                       help="[TREE/VENT] Folder containing reference images (e.g., 'img', 'seg'). "
+                            "If not specified, searches recursively in patient_dir and transform_dir")
+    parser.add_argument('-ref_subfolder', '--ref_subfolder', type=str,
+                       help="[TREE/VENT] Optional subfolder within ref_folder")
+
     # VENT mode arguments
     parser.add_argument('-vent_dir', '--vent_dir', type=Path,
                        help="Patient directory containing ventilation images")
@@ -1516,13 +1975,22 @@ Examples:
                        help="[VENT] Additional filename filters")
     parser.add_argument('-vent_trans_folder', '--vent_transform_folder', type=str,
                        help="[TREE/VENT] Ventilation images Registration folder name")
-    
+
     # Filtering
     parser.add_argument('-include', '--include_images', type=str, nargs='+',
                        help="List of identifiers for images to include")
     parser.add_argument('-exclude', '--exclude_images', type=str, nargs='+',
                        help="List of identifiers for images to exclude")
-    
+
+    # Output filename options
+    parser.add_argument('-out_str', '--output_suffix', type=str, default=None,
+                       help="Output filename suffix. Options: None/empty=no suffix (default), "
+                            "'True'=add '_transformed', or any custom string (e.g., '_warped')")
+    parser.add_argument('-o_filetype', '--output_filetype', type=str, default=None,
+                       choices=['.nii.gz', '.nii', '.mha', '.mhd', '.nrrd', 
+                                'nii.gz', 'nii', 'mha', 'mhd', 'nrrd'],
+                       help="Output file type/extension. Default: preserve input file type")
+
     return parser
 
 
@@ -1530,13 +1998,16 @@ def parse_vent_strings(vent_strings_list):
     """Parse vent_strings from command line format (folder:prefix) to dict"""
     if not vent_strings_list:
         return None
-    
+
     result = {}
     for item in vent_strings_list:
         if ':' in item:
             folder, prefix = item.split(':', 1)
+            print("Vent Folder mapping:")
+            print(folder)
+            print(prefix)
             result[folder] = prefix
-    
+
     return result if result else None
 
 
@@ -1559,16 +2030,20 @@ def main():
         logger.info("=" * 50)
         logger.info("Running in MANUAL MODE with hardcoded parameters")
         logger.info("=" * 50)
-        
+
         mode = manual_params['mode']
         transform_mode = parse_transform_mode(manual_params.get('transform_mode', 'forward'))
-        
+
         # Get explicit file specifications (if any)
         affine_file = manual_params.get('affine_file')
         warp_file = manual_params.get('warp_file')
         inverse_warp_file = manual_params.get('inverse_warp_file')
-        inverse_use_ants = manual_params.get('inverse_use_ants', False)
-        
+        interpolation = manual_params.get('interpolation')
+        output_suffix = manual_params.get('output_suffix')
+        output_filetype = manual_params.get('output_filetype')
+        ref_folder = manual_params.get('ref_folder')
+        ref_subfolder = manual_params.get('ref_subfolder')
+
         if mode == 'direct':
             process_direct_mode(
                 image_path=manual_params['direct_image'],
@@ -1579,13 +2054,15 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
-                inverse_use_ants=inverse_use_ants,
                 ants_path=manual_params['ants_path'],
                 dimensions=manual_params['dimensions'],
                 patient_id=manual_params.get('patient_id'),
-                output_dir=manual_params.get('output_dir')
+                output_dir=manual_params.get('output_dir'),
+                interpolation=interpolation,
+                output_suffix=output_suffix,
+                output_filetype=output_filetype
             )
-        
+
         elif mode == 'tree':
             process_tree_mode(
                 patient_dir=manual_params['patient_dir'],
@@ -1596,16 +2073,20 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
-                inverse_use_ants=inverse_use_ants,
                 ants_path=manual_params['ants_path'],
                 output_dir=manual_params.get('output_dir'),
                 subfolder=manual_params.get('sub_folder'),
                 timepoint=manual_params.get('timepoint'),
                 include_images=manual_params.get('include_images'),
                 exclude_images=manual_params.get('exclude_images'),
-                dimensions=manual_params['dimensions']
+                dimensions=manual_params['dimensions'],
+                interpolation=interpolation,
+                output_suffix=output_suffix,
+                output_filetype=output_filetype,
+                ref_folder=ref_folder,
+                ref_subfolder=ref_subfolder
             )
-        
+
         elif mode == 'vent':
             process_vent_mode(
                 patient_dir=manual_params['patient_dir'],
@@ -1617,7 +2098,6 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
-                inverse_use_ants=inverse_use_ants,
                 ants_path=manual_params['ants_path'],
                 output_dir=manual_params.get('output_dir'),
                 timepoint=manual_params.get('timepoint'),
@@ -1626,31 +2106,40 @@ def main():
                 vent_filters=manual_params.get('vent_img_filters'),
                 include_images=manual_params.get('include_images'),
                 exclude_images=manual_params.get('exclude_images'),
-                dimensions=manual_params['dimensions']
+                dimensions=manual_params['dimensions'],
+                interpolation=interpolation,
+                output_suffix=output_suffix,
+                output_filetype=output_filetype,
+                ref_folder=ref_folder,
+                ref_subfolder=ref_subfolder
             )
-    
+
     else:
         # Parse command line arguments
         parser = create_parser()
         args = parser.parse_args()
-        
+
         mode = args.mode
         transform_mode = parse_transform_mode(args.transform_mode)
-        
+
         # Get explicit file specifications (if any)
         affine_file = args.affine_file
         warp_file = args.warp_file
         inverse_warp_file = args.inverse_warp_file
-        inverse_use_ants = args.inverse_use_ants
-        
+        interpolation = args.interpolation
+        output_suffix = args.output_suffix
+        output_filetype = args.output_filetype
+        ref_folder = args.ref_folder
+        ref_subfolder = args.ref_subfolder
+
         if mode == 'direct':
             # Validate required arguments
             if not args.direct_image or not args.direct_transform_dir or not args.direct_reference:
                 parser.error("DIRECT mode requires: --direct_image, --direct_transform_dir, --direct_reference")
-            
+
             if not args.direct_output and not args.output_dir:
                 parser.error("DIRECT mode requires either --direct_output or --output_dir (with --patient_id)")
-            
+
             process_direct_mode(
                 image_path=str(args.direct_image),
                 transform_dir=str(args.direct_transform_dir),
@@ -1660,19 +2149,21 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
-                inverse_use_ants=inverse_use_ants,
                 ants_path=str(args.ants_path) if args.ants_path else None,
                 dimensions=args.dimensions,
                 patient_id=args.patient_id,
-                output_dir=str(args.output_dir) if args.output_dir else None
+                output_dir=str(args.output_dir) if args.output_dir else None,
+                interpolation=interpolation,
+                output_suffix=output_suffix,
+                output_filetype=output_filetype
             )
-        
+
         elif mode == 'tree':
             # Validate required arguments
             if not all([args.patient_dir, args.img_folder, args.transform_folder, args.reference]):
                 parser.error("TREE mode requires: --patient_dir, --img_folder, "
                            "--transform_folder, --reference")
-            
+
             process_tree_mode(
                 patient_dir=str(args.patient_dir),
                 img_folder=args.img_folder,
@@ -1682,24 +2173,28 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
-                inverse_use_ants=inverse_use_ants,
                 ants_path=str(args.ants_path) if args.ants_path else None,
                 output_dir=str(args.output_dir) if args.output_dir else None,
                 subfolder=args.sub_folder,
                 timepoint=args.timepoint,
                 include_images=args.include_images,
                 exclude_images=args.exclude_images,
-                dimensions=args.dimensions
+                dimensions=args.dimensions,
+                interpolation=interpolation,
+                output_suffix=output_suffix,
+                output_filetype=output_filetype,
+                ref_folder=ref_folder,
+                ref_subfolder=ref_subfolder
             )
-        
+
         elif mode == 'vent':
             # Validate required arguments
             if not all([args.patient_dir, args.transform_folder, args.reference]):
                 parser.error("VENT mode requires: --patient_dir, --transform_folder, --reference")
-            
+
             # Parse vent_strings
             vent_strings = parse_vent_strings(args.vent_strings)
-            
+
             process_vent_mode(
                 patient_dir=str(args.patient_dir),
                 ventilation_patient_dir=str(args.vent_dir) if args.vent_dir else None,
@@ -1710,7 +2205,6 @@ def main():
                 affine_file=affine_file,
                 warp_file=warp_file,
                 inverse_warp_file=inverse_warp_file,
-                inverse_use_ants=inverse_use_ants,
                 ants_path=str(args.ants_path) if args.ants_path else None,
                 output_dir=str(args.output_dir) if args.output_dir else None,
                 timepoint=args.timepoint,
@@ -1719,7 +2213,12 @@ def main():
                 vent_filters=args.vent_filters,
                 include_images=args.include_images,
                 exclude_images=args.exclude_images,
-                dimensions=args.dimensions
+                dimensions=args.dimensions,
+                interpolation=interpolation,
+                output_suffix=output_suffix,
+                output_filetype=output_filetype,
+                ref_folder=ref_folder,
+                ref_subfolder=ref_subfolder
             )
 
 
