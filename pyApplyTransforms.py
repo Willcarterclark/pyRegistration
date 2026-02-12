@@ -1494,6 +1494,7 @@ def process_direct_mode(image_path, transform_dir, reference_path, output_path,
 
     return results
 
+#New LOGIC
 
 def process_tree_mode(patient_dir, img_folder, transform_folder, reference_identifier,
                      transform_mode=TransformMode.FORWARD,
@@ -1506,6 +1507,9 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
     Process images from a tree directory structure.
 
     Output structure: {output_dir}/{patient}/{timepoint}/{reg_folder}/{img_folder}/(subfolder)/
+
+    FIXED: Reference image is now found per-timepoint to ensure consistency between
+    input images and reference images.
 
     Args:
         patient_dir: Patient directory
@@ -1583,23 +1587,13 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
         return results
 
-    # Find reference image using appropriate method
-    if ref_folder:
-        # Use structured tree search
-        reference_path = find_reference_image_tree(
-            patient_dir, reference_identifier, ref_folder,
-            timepoint=timepoint, ref_subfolder=ref_subfolder
-        )
-    else:
-        # Fall back to recursive search
-        search_dirs = [patient_dir, transform_dir]
-        reference_path = find_reference_image(reference_identifier, search_dirs, img_folder)
+    # Check if reference_identifier is already a full path (use it directly for all timepoints)
+    reference_is_full_path = reference_identifier and os.path.exists(reference_identifier)
+    if reference_is_full_path:
+        logger.info(f"Using explicit reference path for all timepoints: {reference_identifier}")
 
-    if not reference_path:
-        logger.error(f"Reference image not found: {reference_identifier}")
-        return results
-
-    logger.info(f"Using reference: {reference_path}")
+    # Track which timepoints we've already found references for (cache)
+    reference_cache = {}
 
     # Process each image
     for idx, row in image_df.iterrows():
@@ -1611,6 +1605,48 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
 
         if not isinstance(imgs, (list, np.ndarray)):
             continue
+
+        # =====================================================================
+        # FIX: Find reference image for THIS SPECIFIC TIMEPOINT
+        # =====================================================================
+        if reference_is_full_path:
+            # Use the explicit path directly
+            reference_path = reference_identifier
+        elif row_timepoint in reference_cache:
+            # Use cached reference for this timepoint
+            reference_path = reference_cache[row_timepoint]
+        else:
+            # Find reference for this specific timepoint
+            logger.info(f"Finding reference image for timepoint: {row_timepoint}")
+            
+            if ref_folder:
+                # Use structured tree search for specific timepoint
+                reference_path = find_reference_for_timepoint(
+                    patient_dir, reference_identifier, ref_folder,
+                    specific_timepoint=row_timepoint,
+                    ref_subfolder=ref_subfolder
+                )
+            else:
+                # Fall back to searching within this timepoint's directory
+                tp_path = os.path.join(patient_dir, row_timepoint)
+                reference_path = find_reference_image(reference_identifier, [tp_path], img_folder)
+            
+            # Cache the result (even if None, to avoid repeated searches)
+            reference_cache[row_timepoint] = reference_path
+            
+            if reference_path:
+                logger.info(f"  Found reference for {row_timepoint}: {reference_path}")
+            else:
+                logger.warning(f"  No reference found for timepoint {row_timepoint}")
+
+        # Skip this timepoint if no reference found
+        if not reference_path:
+            logger.warning(f"Skipping timepoint {row_timepoint} - no matching reference image found")
+            # Count all images in this row as skipped
+            filtered_imgs = filter_images(imgs, include_images, exclude_images)
+            results['skipped'] += len([img for img in filtered_imgs if img != "None"])
+            continue
+        # =====================================================================
 
         # Filter images
         filtered_imgs = filter_images(imgs, include_images, exclude_images)
@@ -1629,7 +1665,9 @@ def process_tree_mode(patient_dir, img_folder, transform_folder, reference_ident
                 final_output_dir = os.path.join(transform_dir, row_folder)
 
         os.makedirs(final_output_dir, exist_ok=True)
-        logger.info(f"Output directory: {final_output_dir}")
+        logger.info(f"Processing timepoint {row_timepoint}")
+        logger.info(f"  Reference: {reference_path}")
+        logger.info(f"  Output directory: {final_output_dir}")
 
         for img in filtered_imgs:
             if img == "None" or reference_identifier in img:
@@ -1676,12 +1714,8 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
 
     Output structure: {output_dir}/{patient}/{timepoint}/{output_reg_folder}/{vent_folder}/
     
-    The output registration folder name is auto-generated based on the transformation chain:
-        {vent_reg_folder}_2_{ref_target}
-    
-    Example:
-        If vent images are in "Reg__TLC_2__RV" and reference is "_1H-HeFRC",
-        output folder will be "Reg__TLC_2__RV_2_1H-HeFRC"
+    FIXED: Reference image is now found per-timepoint to ensure consistency between
+    input images and reference images.
 
     Args:
         patient_dir: Patient directory
@@ -1780,23 +1814,13 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
         return results
 
-    # Find reference image using appropriate method
-    if ref_folder:
-        # Use structured tree search
-        reference_path = find_reference_image_tree(
-            patient_dir, reference_identifier, ref_folder,
-            timepoint=timepoint, ref_subfolder=ref_subfolder
-        )
-    else:
-        # Fall back to recursive search
-        search_dirs = [patient_dir, transform_dir]
-        reference_path = find_reference_image(reference_identifier, search_dirs)
+    # Check if reference_identifier is already a full path (use it directly for all timepoints)
+    reference_is_full_path = reference_identifier and os.path.exists(reference_identifier)
+    if reference_is_full_path:
+        logger.info(f"Using explicit reference path for all timepoints: {reference_identifier}")
 
-    if not reference_path:
-        logger.error(f"Reference image not found: {reference_identifier}")
-        return results
-
-    logger.info(f"Using reference: {reference_path}")
+    # Track which timepoints we've already found references for (cache)
+    reference_cache = {}
 
     # Process each ventilation image
     for idx, row in image_df.iterrows():
@@ -1809,12 +1833,52 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
         if not isinstance(imgs, (list, np.ndarray)):
             continue
 
+        # =====================================================================
+        # FIX: Find reference image for THIS SPECIFIC TIMEPOINT
+        # =====================================================================
+        if reference_is_full_path:
+            # Use the explicit path directly
+            reference_path = reference_identifier
+        elif row_timepoint in reference_cache:
+            # Use cached reference for this timepoint
+            reference_path = reference_cache[row_timepoint]
+        else:
+            # Find reference for this specific timepoint
+            logger.info(f"Finding reference image for timepoint: {row_timepoint}")
+            
+            if ref_folder:
+                # Use structured tree search for specific timepoint
+                reference_path = find_reference_for_timepoint(
+                    patient_dir, reference_identifier, ref_folder,
+                    specific_timepoint=row_timepoint,
+                    ref_subfolder=ref_subfolder
+                )
+            else:
+                # Fall back to searching within this timepoint's directory
+                tp_path = os.path.join(patient_dir, row_timepoint)
+                reference_path = find_reference_image(reference_identifier, [tp_path, transform_dir])
+            
+            # Cache the result (even if None, to avoid repeated searches)
+            reference_cache[row_timepoint] = reference_path
+            
+            if reference_path:
+                logger.info(f"  Found reference for {row_timepoint}: {reference_path}")
+            else:
+                logger.warning(f"  No reference found for timepoint {row_timepoint}")
+
+        # Skip this timepoint if no reference found
+        if not reference_path:
+            logger.warning(f"Skipping timepoint {row_timepoint} - no matching reference image found")
+            # Count all images in this row as skipped
+            filtered_imgs = filter_images(imgs, include_images, exclude_images)
+            results['skipped'] += len([img for img in filtered_imgs if img != "None"])
+            continue
+        # =====================================================================
+
         # Filter images
         filtered_imgs = filter_images(imgs, include_images, exclude_images)
 
         # Generate output registration folder name based on transformation chain
-        # Format: {vent_reg_folder}_2_{ref_target}
-        # e.g., "Reg__TLC_2__RV" + "_1H-HeFRC" -> "Reg__TLC_2__RV_2_1H-HeFRC"
         output_reg_folder = build_output_reg_folder_vent(
             vent_reg_folder if vent_reg_folder else row_reg_folder,
             reference_identifier
@@ -1822,23 +1886,20 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
 
         # Determine output directory
         if output_dir:
-            # Use provided output_dir as base with auto-generated reg folder name
             final_output_dir = build_output_path_vent(
                 output_dir, patient_name, row_timepoint, output_reg_folder, vent_type
             )
         else:
-            # Auto-generate output path based on input structure
-            # Replace the reg folder in the input path with the auto-generated name
-            # Input: {base}/{patient}/{visit}/{vent_reg_folder}/{vent_type}/
-            # Output: {base}/{patient}/{visit}/{output_reg_folder}/{vent_type}/
-            parent_of_vent = os.path.dirname(img_dir)  # {base}/{patient}/{visit}/{vent_reg_folder}
-            parent_of_reg = os.path.dirname(parent_of_vent)  # {base}/{patient}/{visit}
+            parent_of_vent = os.path.dirname(img_dir)
+            parent_of_reg = os.path.dirname(parent_of_vent)
             final_output_dir = os.path.join(parent_of_reg, output_reg_folder, vent_type)
         
-        logger.info(f"Output registration folder: {output_reg_folder}")
+        logger.info(f"Processing timepoint {row_timepoint}, vent type {vent_type}")
+        logger.info(f"  Reference: {reference_path}")
+        logger.info(f"  Output registration folder: {output_reg_folder}")
 
         os.makedirs(final_output_dir, exist_ok=True)
-        logger.info(f"Output directory: {final_output_dir}")
+        logger.info(f"  Output directory: {final_output_dir}")
 
         for img in filtered_imgs:
             if img == "None":
@@ -1870,6 +1931,383 @@ def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg
     logger.info("=" * 70)
 
     return results
+
+#OLD LOGIC
+# def process_tree_mode(patient_dir, img_folder, transform_folder, reference_identifier,
+#                      transform_mode=TransformMode.FORWARD,
+#                      affine_file=None, warp_file=None, inverse_warp_file=None,
+#                      ants_path=None, output_dir=None, subfolder=None, timepoint=None,
+#                      include_images=None, exclude_images=None, dimensions="3",
+#                      interpolation=None, output_suffix=None, output_filetype=None,
+#                      ref_folder=None, ref_subfolder=None):
+#     """
+#     Process images from a tree directory structure.
+
+#     Output structure: {output_dir}/{patient}/{timepoint}/{reg_folder}/{img_folder}/(subfolder)/
+
+#     Args:
+#         patient_dir: Patient directory
+#         img_folder: Folder containing images
+#         transform_folder: Registration folder name
+#         reference_identifier: String to identify reference image (or full path)
+#         transform_mode: TransformMode enum for which transforms to apply
+#         affine_file: Optional explicit affine filename
+#         warp_file: Optional explicit warp filename
+#         inverse_warp_file: Optional explicit inverse warp filename
+#         ants_path: Path to ANTs binaries
+#         output_dir: Output directory (None = save in transform folder)
+#         subfolder: Optional subfolder within img_folder
+#         timepoint: Specific timepoint(s)
+#         include_images: Patterns to include
+#         exclude_images: Patterns to exclude
+#         dimensions: Image dimensions
+#         interpolation: Override interpolation method (None = auto-detect)
+#         output_suffix: Suffix for output filename (None=no suffix, "True"="_transformed", or custom string)
+#         output_filetype: Output file extension (None=preserve input, or ".nii.gz", ".mha", etc.)
+#         ref_folder: Folder containing reference images (e.g., "img", "seg")
+#         ref_subfolder: Optional subfolder within ref_folder
+
+#     Returns:
+#         dict: Summary of processing results
+#     """
+#     logger.info("=" * 70)
+#     logger.info("TREE MODE - Process Images from Tree Structure")
+#     logger.info("=" * 70)
+#     logger.info(f"Patient directory: {patient_dir}")
+#     logger.info(f"Image folder: {img_folder}")
+#     logger.info(f"Transform folder: {transform_folder}")
+#     logger.info(f"Reference identifier: {reference_identifier}")
+#     logger.info(f"Reference folder: {ref_folder if ref_folder else 'auto-detect'}")
+#     logger.info(f"Reference subfolder: {ref_subfolder if ref_subfolder else 'None'}")
+#     logger.info(f"Transform mode: {transform_mode.value}")
+#     if any([affine_file, warp_file, inverse_warp_file]):
+#         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
+#     if interpolation:
+#         logger.info(f"Interpolation override: {interpolation}")
+#     if output_suffix:
+#         logger.info(f"Output suffix: {output_suffix}")
+#     if output_filetype:
+#         logger.info(f"Output filetype: {output_filetype}")
+#     logger.info("=" * 70)
+
+#     results = {'success': 0, 'skipped': 0, 'failed': 0}
+
+#     # Extract patient name from path
+#     patient_name = os.path.basename(patient_dir.rstrip(os.sep))
+#     logger.info(f"Patient name: {patient_name}")
+
+#     # Load images from tree structure
+#     image_df = load_tree_structure(patient_dir, img_folder, subfolder, timepoint)
+
+#     if image_df.empty:
+#         logger.error("No images found in tree structure!")
+#         return results
+
+#     # Find transforms in tree structure (with optional explicit specification)
+#     transform_dir, transform_files, actual_reg_folder, tp_used = find_transform_in_tree(
+#         patient_dir, transform_folder, timepoint,
+#         affine_file=affine_file,
+#         warp_file=warp_file,
+#         inverse_warp_file=inverse_warp_file
+#     )
+
+#     if transform_files is None:
+#         logger.error("No transform files found!")
+#         return results
+
+#     # Validate transform mode
+#     is_valid, error_msg = transform_files.validate_mode(transform_mode)
+#     if not is_valid:
+#         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
+#         return results
+
+#     # Find reference image using appropriate method
+#     if ref_folder:
+#         # Use structured tree search
+#         reference_path = find_reference_image_tree(
+#             patient_dir, reference_identifier, ref_folder,
+#             timepoint=timepoint, ref_subfolder=ref_subfolder
+#         )
+#     else:
+#         # Fall back to recursive search
+#         search_dirs = [patient_dir, transform_dir]
+#         reference_path = find_reference_image(reference_identifier, search_dirs, img_folder)
+
+#     if not reference_path:
+#         logger.error(f"Reference image not found: {reference_identifier}")
+#         return results
+
+#     logger.info(f"Using reference: {reference_path}")
+
+#     # Process each image
+#     for idx, row in image_df.iterrows():
+#         imgs = row['Images']
+#         img_dir = row['Directory']
+#         row_timepoint = row.get('Timepoint', tp_used)
+#         row_folder = row.get('Folder', img_folder)
+#         row_subfolder = row.get('Subfolder', None)
+
+#         if not isinstance(imgs, (list, np.ndarray)):
+#             continue
+
+#         # Filter images
+#         filtered_imgs = filter_images(imgs, include_images, exclude_images)
+
+#         # Determine output directory for this row
+#         if output_dir:
+#             final_output_dir = build_output_path_tree(
+#                 output_dir, patient_name, row_timepoint, actual_reg_folder,
+#                 row_folder, row_subfolder
+#             )
+#         else:
+#             # Save in transform folder, preserving img_folder structure
+#             if row_subfolder:
+#                 final_output_dir = os.path.join(transform_dir, row_folder, row_subfolder)
+#             else:
+#                 final_output_dir = os.path.join(transform_dir, row_folder)
+
+#         os.makedirs(final_output_dir, exist_ok=True)
+#         logger.info(f"Output directory: {final_output_dir}")
+
+#         for img in filtered_imgs:
+#             if img == "None" or reference_identifier in img:
+#                 results['skipped'] += 1
+#                 continue
+
+#             img_path = os.path.join(img_dir, img)
+
+#             # Determine interpolation (use override if provided)
+#             if interpolation:
+#                 interp = interpolation
+#             else:
+#                 interp = "NearestNeighbor" if any(x in img.lower() for x in ['mask', 'seg', 'label']) else "Linear"
+
+#             # Create output filename using helper function
+#             output_name = get_output_filename(img, output_suffix, output_filetype)
+#             output_path = os.path.join(final_output_dir, output_name)
+
+#             # Apply transform
+#             if apply_transform_to_image(img_path, output_path, transform_files,
+#                                        reference_path, transform_mode, ants_path,
+#                                        dimensions, interp):
+#                 results['success'] += 1
+#             else:
+#                 results['failed'] += 1
+
+#     logger.info("=" * 70)
+#     logger.info(f"PROCESSING COMPLETE: {results['success']} success, {results['skipped']} skipped, {results['failed']} failed")
+#     logger.info("=" * 70)
+
+#     return results
+
+
+# def process_vent_mode(patient_dir, ventilation_patient_dir, reg_folder, vent_reg_folder,
+#                      reference_identifier, transform_mode=TransformMode.FORWARD,
+#                      affine_file=None, warp_file=None, inverse_warp_file=None,
+#                      ants_path=None, output_dir=None, timepoint=None,
+#                      vent_dirs=None, vent_strings=None, vent_filters=None,
+#                      include_images=None, exclude_images=None, dimensions="3",
+#                      interpolation=None, output_suffix=None, output_filetype=None,
+#                      ref_folder=None, ref_subfolder=None):
+#     """
+#     Process ventilation images within registration folder structure.
+
+#     Output structure: {output_dir}/{patient}/{timepoint}/{output_reg_folder}/{vent_folder}/
+    
+#     The output registration folder name is auto-generated based on the transformation chain:
+#         {vent_reg_folder}_2_{ref_target}
+    
+#     Example:
+#         If vent images are in "Reg__TLC_2__RV" and reference is "_1H-HeFRC",
+#         output folder will be "Reg__TLC_2__RV_2_1H-HeFRC"
+
+#     Args:
+#         patient_dir: Patient directory
+#         ventilation_patient_dir: Ventilation patient directory (if different)
+#         reg_folder: Registration folder name (contains the transforms to apply)
+#         vent_reg_folder: Ventilation registration folder (where vent images are stored)
+#         reference_identifier: String to identify reference image (used for output folder naming)
+#         transform_mode: TransformMode enum for which transforms to apply
+#         affine_file: Optional explicit affine filename
+#         warp_file: Optional explicit warp filename
+#         inverse_warp_file: Optional explicit inverse warp filename
+#         ants_path: Path to ANTs binaries
+#         output_dir: Output base directory (None = output alongside input)
+#         timepoint: Specific timepoint(s)
+#         vent_dirs: List of ventilation type folders
+#         vent_strings: Dict mapping vent folder to image prefix
+#         vent_filters: Additional filename filters
+#         include_images: Patterns to include
+#         exclude_images: Patterns to exclude
+#         dimensions: Image dimensions
+#         interpolation: Override interpolation method (None = auto-detect)
+#         output_suffix: Suffix for output filename (None=no suffix, "True"="_transformed", or custom string)
+#         output_filetype: Output file extension (None=preserve input, or ".nii.gz", ".mha", etc.)
+#         ref_folder: Folder containing reference images (e.g., "img", "seg")
+#         ref_subfolder: Optional subfolder within ref_folder
+
+#     Returns:
+#         dict: Summary of processing results
+#     """
+#     logger.info("=" * 70)
+#     logger.info("VENT MODE - Process Ventilation Images")
+#     logger.info("=" * 70)
+#     logger.info(f"Patient directory: {patient_dir}")
+#     logger.info(f"Transform folder (source): {reg_folder}")
+#     logger.info(f"Vent registration folder: {vent_reg_folder}")
+#     logger.info(f"Reference identifier: {reference_identifier}")
+#     logger.info(f"Reference folder: {ref_folder if ref_folder else 'auto-detect'}")
+#     logger.info(f"Reference subfolder: {ref_subfolder if ref_subfolder else 'None'}")
+#     logger.info(f"Transform mode: {transform_mode.value}")
+#     logger.info(f"Vent directories: {vent_dirs}")
+#     if any([affine_file, warp_file, inverse_warp_file]):
+#         logger.info(f"Explicit files: affine={affine_file}, warp={warp_file}, inv_warp={inverse_warp_file}")
+#     if interpolation:
+#         logger.info(f"Interpolation override: {interpolation}")
+#     if output_suffix:
+#         logger.info(f"Output suffix: {output_suffix}")
+#     if output_filetype:
+#         logger.info(f"Output filetype: {output_filetype}")
+#     logger.info("=" * 70)
+
+#     if vent_dirs is None:
+#         vent_dirs = DEFAULT_VENT_DIRS
+#     if vent_strings is None:
+#         vent_strings = DEFAULT_VENT_STRINGS
+
+#     results = {'success': 0, 'skipped': 0, 'failed': 0}
+
+#     # Extract patient name from path
+#     patient_name = os.path.basename(patient_dir.rstrip(os.sep))
+#     logger.info(f"Patient name: {patient_name}")
+
+#     # Load ventilation images
+#     if not ventilation_patient_dir:
+#         logger.info("No ventilation image folder specified - using default patient folder...")
+#         if not vent_reg_folder:
+#             logger.info("No ventilation-registration folder specified - using default registration folder...")
+#             image_df = load_vent_structure(patient_dir, reg_folder, timepoint,
+#                                        vent_dirs, vent_strings, vent_filters)
+#         else:
+#             image_df = load_vent_structure(patient_dir, vent_reg_folder, timepoint,
+#                                        vent_dirs, vent_strings, vent_filters)
+#     else:
+#         image_df = load_vent_structure(ventilation_patient_dir, vent_reg_folder, timepoint,
+#                                    vent_dirs, vent_strings, vent_filters)
+
+#     if image_df.empty:
+#         logger.error("No ventilation images found!")
+#         return results
+
+#     # Find transforms - they should be in the original patient folder! (differs to vent folder)
+#     # With optional explicit specification
+#     transform_dir, transform_files, actual_reg_folder, tp_used = find_transform_in_tree(
+#         patient_dir, reg_folder, timepoint,
+#         affine_file=affine_file,
+#         warp_file=warp_file,
+#         inverse_warp_file=inverse_warp_file
+#     )
+
+#     if transform_files is None:
+#         logger.error("No transform files found!")
+#         return results
+
+#     # Validate transform mode
+#     is_valid, error_msg = transform_files.validate_mode(transform_mode)
+#     if not is_valid:
+#         logger.error(f"Cannot use transform mode '{transform_mode.value}': {error_msg}")
+#         return results
+
+#     # Find reference image using appropriate method
+#     if ref_folder:
+#         # Use structured tree search
+#         reference_path = find_reference_image_tree(
+#             patient_dir, reference_identifier, ref_folder,
+#             timepoint=timepoint, ref_subfolder=ref_subfolder
+#         )
+#     else:
+#         # Fall back to recursive search
+#         search_dirs = [patient_dir, transform_dir]
+#         reference_path = find_reference_image(reference_identifier, search_dirs)
+
+#     if not reference_path:
+#         logger.error(f"Reference image not found: {reference_identifier}")
+#         return results
+
+#     logger.info(f"Using reference: {reference_path}")
+
+#     # Process each ventilation image
+#     for idx, row in image_df.iterrows():
+#         imgs = row['Images']
+#         img_dir = row['Directory']
+#         row_timepoint = row.get('Timepoint', tp_used)
+#         vent_type = row.get('VentType', 'unknown')
+#         row_reg_folder = row.get('RegFolder', actual_reg_folder)
+
+#         if not isinstance(imgs, (list, np.ndarray)):
+#             continue
+
+#         # Filter images
+#         filtered_imgs = filter_images(imgs, include_images, exclude_images)
+
+#         # Generate output registration folder name based on transformation chain
+#         # Format: {vent_reg_folder}_2_{ref_target}
+#         # e.g., "Reg__TLC_2__RV" + "_1H-HeFRC" -> "Reg__TLC_2__RV_2_1H-HeFRC"
+#         output_reg_folder = build_output_reg_folder_vent(
+#             vent_reg_folder if vent_reg_folder else row_reg_folder,
+#             reference_identifier
+#         )
+
+#         # Determine output directory
+#         if output_dir:
+#             # Use provided output_dir as base with auto-generated reg folder name
+#             final_output_dir = build_output_path_vent(
+#                 output_dir, patient_name, row_timepoint, output_reg_folder, vent_type
+#             )
+#         else:
+#             # Auto-generate output path based on input structure
+#             # Replace the reg folder in the input path with the auto-generated name
+#             # Input: {base}/{patient}/{visit}/{vent_reg_folder}/{vent_type}/
+#             # Output: {base}/{patient}/{visit}/{output_reg_folder}/{vent_type}/
+#             parent_of_vent = os.path.dirname(img_dir)  # {base}/{patient}/{visit}/{vent_reg_folder}
+#             parent_of_reg = os.path.dirname(parent_of_vent)  # {base}/{patient}/{visit}
+#             final_output_dir = os.path.join(parent_of_reg, output_reg_folder, vent_type)
+        
+#         logger.info(f"Output registration folder: {output_reg_folder}")
+
+#         os.makedirs(final_output_dir, exist_ok=True)
+#         logger.info(f"Output directory: {final_output_dir}")
+
+#         for img in filtered_imgs:
+#             if img == "None":
+#                 results['skipped'] += 1
+#                 continue
+
+#             img_path = os.path.join(img_dir, img)
+
+#             # Determine interpolation (use override if provided, ventilation images typically use linear)
+#             if interpolation:
+#                 interp = interpolation
+#             else:
+#                 interp = "NearestNeighbor" if any(x in img.lower() for x in ['mask', 'seg', 'label']) else "Linear"
+
+#             # Create output filename using helper function
+#             output_name = get_output_filename(img, output_suffix, output_filetype)
+#             output_path = os.path.join(final_output_dir, output_name)
+
+#             # Apply transform
+#             if apply_transform_to_image(img_path, output_path, transform_files,
+#                                        reference_path, transform_mode, ants_path,
+#                                        dimensions, interp):
+#                 results['success'] += 1
+#             else:
+#                 results['failed'] += 1
+
+#     logger.info("=" * 70)
+#     logger.info(f"PROCESSING COMPLETE: {results['success']} success, {results['skipped']} skipped, {results['failed']} failed")
+#     logger.info("=" * 70)
+
+#     return results
 
 
 #%% Argument Parsing
