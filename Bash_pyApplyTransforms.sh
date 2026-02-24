@@ -71,7 +71,7 @@ python $apply_script --mode tree \
     -trans_folder "Reg__1H-XeFRC_2__RV" \
     -img_folder "img" \
     -ref "_RV" \
-	-ref_folder "img" \ 
+	-ref_folder "img" \
     -include "_XeFRC" \
     -exclude "mask" "seg" \
     -out_dir "Vent_XeFRC_2_RV" \
