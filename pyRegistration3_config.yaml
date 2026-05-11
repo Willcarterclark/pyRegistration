@@ -1,0 +1,170 @@
+# =============================================================================
+# registration_config.yaml
+# =============================================================================
+# Configuration for Proton_py_Registration2-3.py
+#
+# USAGE:
+#   python Proton_py_Registration2-3.py -yaml registration_config.yaml -pat_dir /path/to/patient
+#
+# When -yaml is used, only -pat_dir is required on the command line.
+# Any CLI flag still overrides the corresponding YAML value.
+#
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# PATHS — Tool locations and directory structure
+# ---------------------------------------------------------------------------
+paths:
+  # ANTs binary directory
+  ants_path: /usr/local/community/polaris/tools/ants/2.5.1/bin/
+
+  # Scan folder name within patient/timepoint structure
+  scan_folder: "img"                     # -scn_dir
+
+  # Segmentation folder name (null = no masks)
+  seg_folder: "seg"                      # -seg_dir
+
+  # Optional subfolder within scan_folder
+  sub_folder: null                       # -sub_dir
+
+  # Output directory (null = in-folder next to images)
+  output_directory: null                 # -out_dir
+
+
+# ---------------------------------------------------------------------------
+# OPTIONS — Image identifiers and processing settings
+# ---------------------------------------------------------------------------
+options:
+  # Image identifiers (substrings to match filenames)
+  img_fix: "_RV"                         # -f  (Fixed image = expiration)
+  img_mov: "_TLC"                        # -m  (Moving image = inspiration)
+
+  # Mask identifiers (null = use same as image identifiers)
+  img_fix_mask: null                     # -f_mask
+  img_mov_mask: null                     # -m_mask
+
+  # Registration dimensions
+  dimensions: "3"                        # -dim
+
+  # Mask expansion radius for registration (0 = no expansion, default: 8)
+  reg_expand_mask: 8                     # -reg_exp_mask
+
+  # Output file type
+  output_filetype: ".nii.gz"             # -out_type
+
+  # Save input copies to registration directory
+  save_input_copies: false               # -saveinputs
+
+  # Apply masks to input images before registration
+  use_masked_inputs: false               # -masked_inputs
+
+
+# ---------------------------------------------------------------------------
+# REGISTRATION — Runtime and parameter settings
+# ---------------------------------------------------------------------------
+registration:
+  # Registration runtime: 'ants' (default) or 'fireants' (GPU)
+  runtime: ants
+
+  # =========================================================================
+  # ANTs registration command
+  # =========================================================================
+  # The full ANTs command string with placeholders.
+  # Placeholders:
+  #   {output_prefix_full_placeholder} — output path prefix
+  #   {fixed_placeholder}              — fixed image path
+  #   {moving_placeholder}             — moving image path
+  #   {addmasks}                       — replaced with real masks at that stage
+  #   {nomasks}                        — replaced with dummy masks (no masking)
+  #
+  # NOTE: In YAML, use > or | for multi-line strings. The > folds newlines
+  # into spaces (ideal for one long command). Be careful with quoting.
+  #
+  ants_command: >-
+    --dimensionality 3
+    --verbose 1
+    --output "{output_prefix_full_placeholder}"
+    --use-histogram-matching 1
+    --initial-moving-transform "[{fixed_placeholder},{moving_placeholder},1]"
+    {nomasks}
+    --transform "Rigid[0.1]"
+    --metric "MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]"
+    --convergence "1000x500x250x100"
+    --smoothing-sigmas "3x2x1x0"
+    --shrink-factors "8x4x2x1"
+    {nomasks}
+    --transform "Affine[0.1]"
+    --metric "MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.75]"
+    --convergence "1000x500x250x100"
+    --smoothing-sigmas "3x2x1x0"
+    --shrink-factors "8x4x2x1"
+    {addmasks}
+    --transform "BSplineSyN[0.2,65,0,3]"
+    --metric "CC[{fixed_placeholder},{moving_placeholder},1,2]"
+    --convergence "500x200x70x50x10"
+    --smoothing-sigmas "5x3x2x1x0"
+    --shrink-factors "10x6x4x2x1"
+
+
+  # =========================================================================
+  # FireANTs parameters (only used when runtime: fireants)
+  # =========================================================================
+  # GPU-accelerated diffeomorphic registration via FireANTs
+  # See: https://github.com/rohitrango/FireANTs
+  #
+  fireants:
+    # Registration model:
+    #   'GreedySyN'       — Greedy diffeomorphic (default, recommended)
+    #   'Affine'          — Affine only
+    #   'Rigid'           — Rigid only
+    #   'AffineGreedySyN' — Affine initialisation then GreedySyN
+    model: GreedySyN
+
+    # Multi-scale pyramid: coarse → fine
+    # Each list must have the same number of entries
+    scales: [4, 2, 1]
+    iterations: [200, 100, 50]
+
+    # Optimisation
+    learning_rate: 0.5
+
+    # Similarity metric: 'NCC' (default), 'MSE', or 'MI'
+    metric: NCC
+    ncc_window: 7              # Window size for NCC metric
+
+    # Regularisation (smoothing of displacement/update fields)
+    smooth_displacement: 1.5   # Gaussian sigma for displacement field
+    smooth_update: 0.5         # Gaussian sigma for update field
+
+
+# =============================================================================
+# EXAMPLES
+# =============================================================================
+#
+# Run with YAML (only patient dir needed):
+#   python Proton_py_Registration2-3.py \
+#       -yaml registration_config.yaml \
+#       -pat_dir /data/patient01
+#
+# Override runtime to FireANTs:
+#   python Proton_py_Registration2-3.py \
+#       -yaml registration_config.yaml \
+#       -pat_dir /data/patient01 \
+#       -runtime fireants
+#
+# Override a single setting:
+#   python Proton_py_Registration2-3.py \
+#       -yaml registration_config.yaml \
+#       -pat_dir /data/patient01 \
+#       -f "_FRC" -m "_TLC"
+#
+# Full CLI (no YAML, backward compatible):
+#   python Proton_py_Registration2-3.py \
+#       -pat_dir /data/patient01 \
+#       -scn_dir img -seg_dir seg \
+#       -f _RV -m _TLC \
+#       -ants_path /path/to/ants/bin/ \
+#       -ants_reg_params "$AntsRegCmd"
+#
+# =============================================================================
