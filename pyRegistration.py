@@ -20,6 +20,13 @@ import shlex
 import csv
 import ast
 
+#FIREANTS Registration Support
+try:
+    import fireants
+    FIREANTS_AVAILABLE = True
+except ImportError:
+    FIREANTS_AVAILABLE = False
+
 from pathlib import Path
 from typing import Optional, Tuple
 from scipy import stats
@@ -52,33 +59,180 @@ Registration parameters need to be defined by input BASH script, can pass ANTs c
 
 #%% BASH Input
 
-# Initialize argument parser
-parser = argparse.ArgumentParser(description="Script for image registration using ANTs")
+def load_yaml_config(config_path=None):
+    """Load YAML config from explicit path or auto-detect alongside script."""
+    try:
+        import yaml
+    except ImportError:
+        print("PyYAML not installed — skipping YAML config loading.")
+        return {}
+    
+    if config_path is not None:
+        config_path = Path(config_path)
+        if config_path.exists():
+            print(f"Loading YAML config from: {config_path}")
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f) or {}
+            print(f"  Loaded sections: {list(config.keys())}")
+            return config
+        else:
+            print(f"WARNING: Specified YAML config not found: {config_path}")
+            return {}
+    
+    script_dir = Path(__file__).parent
+    for name in ['registration_config.yaml', 'registration_config.yml']:
+        auto_path = script_dir / name
+        if auto_path.exists():
+            print(f"Auto-detected YAML config: {auto_path}")
+            with open(auto_path, 'r') as f:
+                config = yaml.safe_load(f) or {}
+            return config
+    return {}
 
-# Define the command-line arguments
-parser.add_argument('-pat_dir', '--dir_pat', help="Directory of a single patient", type=Path, required=True)
-parser.add_argument('-scn_dir', '--scan_folder', help="Folder to find within patient directory", type=str, required=True)
-parser.add_argument('-seg_dir', '--seg_folder', help="Segmentation folder", type=str)
-parser.add_argument('-ants_path', '--ants_dir', type=Path, required=True)
-parser.add_argument('-f', '--img_fix', help="Fixed image identifier", type=str, required=True)
-parser.add_argument('-m', '--img_mov', help="Moving image identifier", type=str, required=True)
-parser.add_argument('-f_mask', '--img_fix_mask', help="Mask Fixed image identifier", type=str)
-parser.add_argument('-m_mask', '--img_mov_mask', help="Mask Moving image identifier", type=str)
-parser.add_argument('-sub_dir', '--sub_folder',type=str)
-parser.add_argument('-dim','--dimensions', help="Registration Dimensions", type=str)
-parser.add_argument('-ants_reg_params', '--ants_registration_parameters', help="ANTs registration command parameters", type=str, required=True)
-parser.add_argument('-out_dir', '--output_directory', help="Optional output directory for registration results", type=Path)
-parser.add_argument('-reg_exp_mask', '--reg_expand_mask', help="Expand Registration Mask - use 0 for none, integer 1-10 for voxel size filter, default is 8", type=str)
-parser.add_argument('-out_type', '--output_filetype', help="Output file type (e.g., '.nii.gz', '.mha', '.nii'). Default is '.nii.gz'", type=str, default='.nii.gz')
-parser.add_argument('-saveinputs', '--save_input_copies', 
-                    help="Save copies of input images and masks to registration directory", 
-                    action='store_true', default=False)
-parser.add_argument('-masked_inputs','--use_masked_inputs', 
-                    help="Apply Masks (if found) to the input fixed and moving images prior to registration - works independently of mask definitions in ANTs command call.", 
-                    action='store_true', default=False)
+
+def parse_arguments():
+    """
+    Two-pass argument parser with YAML support.
+    
+    When -yaml is provided, only -pat_dir is required on the command line.
+    All other arguments fall back to YAML values, then to hardcoded defaults.
+    """
+    # Pass 1: grab -yaml flag
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument('-yaml', '--yaml_config', type=Path, default=None)
+    pre_args, _ = pre_parser.parse_known_args()
+    
+    # Load YAML
+    yaml_config = {}
+    if pre_args.yaml_config is not None:
+        yaml_config = load_yaml_config(config_path=pre_args.yaml_config)
+    else:
+        yaml_config = load_yaml_config()
+    
+    yaml_paths = yaml_config.get('paths', {}) or {}
+    yaml_options = yaml_config.get('options', {}) or {}
+    yaml_registration = yaml_config.get('registration', {}) or {}
+    have_yaml = bool(yaml_config)
+    
+    # Pass 2: full parser with YAML-informed defaults
+    parser = argparse.ArgumentParser(
+        description="Script for image registration using ANTs or FireANTs.\n"
+                    "Use -yaml to load a config file; only -pat_dir is then required.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # YAML flag
+    parser.add_argument('-yaml', '--yaml_config', type=Path, default=None,
+                        help="Path to YAML config file")
+    
+    # Required arguments (fall back to YAML)
+    parser.add_argument('-pat_dir', '--dir_pat', help="Directory of a single patient", 
+                        type=Path, required=True)
+    parser.add_argument('-scn_dir', '--scan_folder', help="Folder to find within patient directory", 
+                        type=str, required=not have_yaml,
+                        default=yaml_paths.get('scan_folder', None))
+    parser.add_argument('-seg_dir', '--seg_folder', help="Segmentation folder", type=str,
+                        default=yaml_paths.get('seg_folder', None))
+    parser.add_argument('-ants_path', '--ants_dir', type=Path, 
+                        required=not have_yaml,
+                        default=yaml_paths.get('ants_path', None))
+    parser.add_argument('-f', '--img_fix', help="Fixed image identifier", type=str, 
+                        required=not have_yaml,
+                        default=yaml_options.get('img_fix', None))
+    parser.add_argument('-m', '--img_mov', help="Moving image identifier", type=str, 
+                        required=not have_yaml,
+                        default=yaml_options.get('img_mov', None))
+    parser.add_argument('-f_mask', '--img_fix_mask', help="Mask Fixed image identifier", type=str,
+                        default=yaml_options.get('img_fix_mask', None))
+    parser.add_argument('-m_mask', '--img_mov_mask', help="Mask Moving image identifier", type=str,
+                        default=yaml_options.get('img_mov_mask', None))
+    parser.add_argument('-sub_dir', '--sub_folder', type=str,
+                        default=yaml_paths.get('sub_folder', None))
+    parser.add_argument('-dim','--dimensions', help="Registration Dimensions", type=str,
+                        default=yaml_options.get('dimensions', '3'))
+    parser.add_argument('-ants_reg_params', '--ants_registration_parameters', 
+                        help="ANTs registration command parameters", type=str,
+                        required=False,
+                        default=yaml_registration.get('ants_command', None))
+    parser.add_argument('-out_dir', '--output_directory', 
+                        help="Optional output directory for registration results", type=Path,
+                        default=yaml_paths.get('output_directory', None))
+    parser.add_argument('-reg_exp_mask', '--reg_expand_mask', 
+                        help="Expand Registration Mask (0=none, 1-10 voxels, default: 8)", type=str,
+                        default=yaml_options.get('reg_expand_mask', '8'))
+    parser.add_argument('-out_type', '--output_filetype', 
+                        help="Output file type (default: '.nii.gz')", type=str, 
+                        default=yaml_options.get('output_filetype', '.nii.gz'))
+    parser.add_argument('-saveinputs', '--save_input_copies', 
+                        help="Save copies of input images and masks to registration directory", 
+                        action='store_true', 
+                        default=yaml_options.get('save_input_copies', False))
+    parser.add_argument('-masked_inputs','--use_masked_inputs', 
+                        help="Apply Masks to input images prior to registration", 
+                        action='store_true', 
+                        default=yaml_options.get('use_masked_inputs', False))
+    
+    # =========================================================================
+    # Registration runtime selection
+    # =========================================================================
+    parser.add_argument('-runtime', '--registration_runtime',
+                        help="Registration runtime: 'ants' (default, subprocess) or 'fireants' (GPU)",
+                        type=str, default=yaml_registration.get('runtime', 'ants'),
+                        choices=['ants', 'fireants'])
+    
+    # =========================================================================
+    # FireANTs-specific parameters (only used when runtime=fireants)
+    # =========================================================================
+    yaml_fireants = yaml_registration.get('fireants', {}) or {}
+    fa_grp = parser.add_argument_group('FireANTs parameters',
+        description="Parameters for FireANTs GPU registration (only used with -runtime fireants)")
+    fa_grp.add_argument('--fireants_model', type=str, 
+                        default=yaml_fireants.get('model', 'GreedySyN'),
+                        choices=['GreedySyN', 'Affine', 'Rigid', 'AffineGreedySyN'],
+                        help="FireANTs registration model (default: GreedySyN)")
+    fa_grp.add_argument('--fireants_scales', type=int, nargs='+',
+                        default=yaml_fireants.get('scales', [4, 2, 1]),
+                        help="Multi-scale pyramid levels (default: 4 2 1)")
+    fa_grp.add_argument('--fireants_iterations', type=int, nargs='+',
+                        default=yaml_fireants.get('iterations', [200, 100, 50]),
+                        help="Iterations per scale level (default: 200 100 50)")
+    fa_grp.add_argument('--fireants_lr', type=float,
+                        default=yaml_fireants.get('learning_rate', 0.5),
+                        help="Learning rate (default: 0.5)")
+    fa_grp.add_argument('--fireants_metric', type=str,
+                        default=yaml_fireants.get('metric', 'NCC'),
+                        choices=['NCC', 'MSE', 'MI'],
+                        help="Similarity metric (default: NCC)")
+    fa_grp.add_argument('--fireants_ncc_win', type=int,
+                        default=yaml_fireants.get('ncc_window', 7),
+                        help="NCC window size (default: 7)")
+    fa_grp.add_argument('--fireants_smooth_disp', type=float,
+                        default=yaml_fireants.get('smooth_displacement', 1.5),
+                        help="Displacement field smoothing sigma (default: 1.5)")
+    fa_grp.add_argument('--fireants_smooth_update', type=float,
+                        default=yaml_fireants.get('smooth_update', 0.5),
+                        help="Update field smoothing sigma (default: 0.5)")
+    
+    args = parser.parse_args()
+    args._yaml_config = yaml_config
+    
+    # Validate required fields
+    missing = []
+    for attr, label in [('scan_folder', '-scn_dir'), ('ants_dir', '-ants_path'),
+                        ('img_fix', '-f'), ('img_mov', '-m')]:
+        if getattr(args, attr) is None:
+            missing.append(label)
+    # ants_reg_params required for ants runtime
+    if args.registration_runtime == 'ants' and not args.ants_registration_parameters:
+        missing.append('-ants_reg_params (required for -runtime ants)')
+    if missing:
+        parser.error(f"Missing required arguments (via CLI or YAML): {', '.join(missing)}")
+    
+    return args
+
 
 # Parse arguments
-args = parser.parse_args()
+args = parse_arguments()
 
 # Extract and convert arguments
 path_patient_dir = str(args.dir_pat)
@@ -91,12 +245,13 @@ img_mov_mask = str(args.img_mov_mask) if args.img_mov_mask else None
 img_mov = str(args.img_mov)
 sub_folder = str(args.sub_folder) if args.sub_folder else None
 dimensions = str(args.dimensions) if args.dimensions else "3"
-ants_reg_params_str = str(args.ants_registration_parameters)
+ants_reg_params_str = str(args.ants_registration_parameters) if args.ants_registration_parameters else None
 output_directory = str(args.output_directory) if args.output_directory else None
 reg_expand_mask = int(args.reg_expand_mask) if args.reg_expand_mask else 8
 output_filetype = str(args.output_filetype) if args.output_filetype else '.nii.gz'
 save_input_copies = args.save_input_copies
 use_mask_inputs = args.use_masked_inputs if args.use_masked_inputs else None
+registration_runtime = args.registration_runtime
 
 # Ensure output filetype starts with a dot
 if not output_filetype.startswith('.'):
@@ -114,6 +269,12 @@ print(f"ANTs Registration Parameters String: {ants_reg_params_str}")
 print(f"Output Directory: {output_directory if output_directory else 'In-folder (default)'}")
 print(f"Registration Mask Expansion: {reg_expand_mask}")
 print(f"Output File Type: {output_filetype}")
+print(f"Registration Runtime: {registration_runtime}")
+if registration_runtime == 'fireants':
+    print(f"  FireANTs model: {args.fireants_model}")
+    print(f"  FireANTs scales: {args.fireants_scales}")
+    print(f"  FireANTs iterations: {args.fireants_iterations}")
+    print(f"  FireANTs metric: {args.fireants_metric}")
 
 #%% Load Directory functions
 
@@ -550,7 +711,8 @@ def format_command_string(cmd_string):
 
 def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8, 
              ants_reg_params_str=None, output_base_dir=None, Fixed_mask=None, 
-             Moving_mask=None, dimensions="3", output_filetype='.nii.gz', mask_inputs=False):
+             Moving_mask=None, dimensions="3", output_filetype='.nii.gz', mask_inputs=False,
+             registration_runtime='ants', fireants_args=None):
     
     
     global fix_img_path
@@ -783,21 +945,41 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
             
         
         print("Running Registration with unmasked images and expanded masks")
-        success = run_reg(
-            fixed=fix_img_path,  # ORIGINAL image, not masked
-            moving=mov_img_path,  # ORIGINAL image, not masked
-            fixed_mask_original=fix_seg_path,  # Original mask for output
-            moving_mask_original=mov_seg_path,  # Original mask for output
-            fixed_mask_expanded=fix_seg_expanded_path,  # Expanded mask for registration
-            moving_mask_expanded=mov_seg_expanded_path,  # Expanded mask for registration
-            output_dir=Reg_dir,
-            output_prefix=reg_str + "_",
-            ants_path=path_ants,
-            ants_reg_params_template=ants_reg_params_str,
-            use_masks=(has_segs and fix_seg_path is not None),
-            dimensions=dimensions,
-            output_filetype=output_filetype
-        )
+        print(f"  Runtime: {registration_runtime}")
+        
+        if registration_runtime == 'fireants':
+            success = run_reg_fireants(
+                fixed=fix_img_path,
+                moving=mov_img_path,
+                fixed_mask_original=fix_seg_path,
+                moving_mask_original=mov_seg_path,
+                fixed_mask_expanded=fix_seg_expanded_path,
+                moving_mask_expanded=mov_seg_expanded_path,
+                output_dir=Reg_dir,
+                output_prefix=reg_str + "_",
+                ants_path=path_ants,
+                use_masks=(has_segs and fix_seg_path is not None),
+                dimensions=dimensions,
+                output_filetype=output_filetype,
+                fireants_args=fireants_args
+            )
+        else:
+            # Default: ANTs subprocess registration
+            success = run_reg(
+                fixed=fix_img_path,
+                moving=mov_img_path,
+                fixed_mask_original=fix_seg_path,
+                moving_mask_original=mov_seg_path,
+                fixed_mask_expanded=fix_seg_expanded_path,
+                moving_mask_expanded=mov_seg_expanded_path,
+                output_dir=Reg_dir,
+                output_prefix=reg_str + "_",
+                ants_path=path_ants,
+                ants_reg_params_template=ants_reg_params_str,
+                use_masks=(has_segs and fix_seg_path is not None),
+                dimensions=dimensions,
+                output_filetype=output_filetype
+            )
             
         if success:
             print("Iteration complete...")
@@ -807,6 +989,238 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
         print("--")
     
     return
+
+#%% Run registration - FireANTs
+
+def run_reg_fireants(fixed, moving, output_dir, output_prefix,
+                     fixed_mask_original=None, moving_mask_original=None,
+                     fixed_mask_expanded=None, moving_mask_expanded=None,
+                     ants_path=None, use_masks=False,
+                     dimensions="3", output_filetype='.nii.gz',
+                     fireants_args=None):
+    """
+    Perform image registration using FireANTs (GPU-accelerated diffeomorphic registration).
+    
+    Produces the same output file structure as the ANTs run_reg function:
+      - {prefix}1Warp.nii.gz          (forward displacement field)
+      - {prefix}1InverseWarp.nii.gz   (inverse displacement field)
+      - {prefix}0GenericAffine.mat     (affine transform)
+      - {prefix}warped.nii.gz         (warped moving image)
+      - {prefix}inv_warped.nii.gz     (inverse-warped fixed image)
+    
+    Parameters
+    ----------
+    fireants_args : argparse.Namespace
+        Parsed args containing fireants_model, fireants_scales, etc.
+    """
+    import torch
+    
+    if not FIREANTS_AVAILABLE:
+        print("ERROR: FireANTs is not installed. Install with: pip install fireants")
+        print("  See: https://github.com/rohitrango/FireANTs")
+        return False
+    
+    from fireants.io import Image as FAImage
+    from fireants.registration import GreedySyN, Affine, Rigid
+    
+    print("=" * 80)
+    print("FIREANTS GPU REGISTRATION")
+    print("=" * 80)
+    
+    # Parse FireANTs parameters
+    model_name = fireants_args.fireants_model if fireants_args else 'GreedySyN'
+    scales = fireants_args.fireants_scales if fireants_args else [4, 2, 1]
+    iterations = fireants_args.fireants_iterations if fireants_args else [200, 100, 50]
+    lr = fireants_args.fireants_lr if fireants_args else 0.5
+    metric = fireants_args.fireants_metric if fireants_args else 'NCC'
+    ncc_win = fireants_args.fireants_ncc_win if fireants_args else 7
+    smooth_disp = fireants_args.fireants_smooth_disp if fireants_args else 1.5
+    smooth_update = fireants_args.fireants_smooth_update if fireants_args else 0.5
+    
+    print(f"  Model: {model_name}")
+    print(f"  Scales: {scales}")
+    print(f"  Iterations: {iterations}")
+    print(f"  Learning rate: {lr}")
+    print(f"  Metric: {metric}")
+    print(f"  Fixed:  {os.path.basename(fixed)}")
+    print(f"  Moving: {os.path.basename(moving)}")
+    
+    # Construct output paths (match ANTs naming convention)
+    output_prefix_full = os.path.join(output_dir, output_prefix)
+    warp_file = f"{output_prefix_full}1Warp.nii.gz"
+    inv_warp_file = f"{output_prefix_full}1InverseWarp.nii.gz"
+    affine_file = f"{output_prefix_full}0GenericAffine.mat"
+    moving_warped_output = os.path.join(output_dir, f"{output_prefix}warped{output_filetype}")
+    fixed_warped_output = os.path.join(output_dir, f"{output_prefix}inv_warped{output_filetype}")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"  Device: {device}")
+    if device == 'cpu':
+        print("  WARNING: No GPU detected — FireANTs will run on CPU (slow!)")
+    
+    try:
+        # =====================================================================
+        # Load images as FireANTs Image objects
+        # =====================================================================
+        print("\n[Step 1] Loading images for FireANTs...")
+        fixed_fa = FAImage.load(fixed)
+        moving_fa = FAImage.load(moving)
+        
+        # Load masks if provided
+        fixed_mask_fa = None
+        moving_mask_fa = None
+        if use_masks and fixed_mask_expanded:
+            fixed_mask_fa = FAImage.load(fixed_mask_expanded)
+            print(f"  Loaded fixed mask: {os.path.basename(fixed_mask_expanded)}")
+        if use_masks and moving_mask_expanded:
+            moving_mask_fa = FAImage.load(moving_mask_expanded)
+            print(f"  Loaded moving mask: {os.path.basename(moving_mask_expanded)}")
+        
+        # =====================================================================
+        # Build metric
+        # =====================================================================
+        if metric == 'NCC':
+            from fireants.losses import NCC
+            loss_fn = NCC(win=ncc_win)
+        elif metric == 'MSE':
+            from fireants.losses import MSE
+            loss_fn = MSE()
+        elif metric == 'MI':
+            from fireants.losses import MutualInformation
+            loss_fn = MutualInformation()
+        else:
+            print(f"  WARNING: Unknown metric '{metric}', defaulting to NCC")
+            from fireants.losses import NCC
+            loss_fn = NCC(win=ncc_win)
+        
+        # =====================================================================
+        # Run registration based on model
+        # =====================================================================
+        print(f"\n[Step 2] Running {model_name} registration...")
+        
+        if model_name == 'Affine':
+            reg = Affine(
+                scales=scales,
+                iterations=iterations,
+                loss_fn=loss_fn,
+                learning_rate=lr,
+            )
+        elif model_name == 'Rigid':
+            reg = Rigid(
+                scales=scales,
+                iterations=iterations,
+                loss_fn=loss_fn,
+                learning_rate=lr,
+            )
+        elif model_name in ('GreedySyN', 'AffineGreedySyN'):
+            reg = GreedySyN(
+                scales=scales,
+                iterations=iterations,
+                loss_fn=loss_fn,
+                learning_rate=lr,
+                smooth_displacement=smooth_disp,
+                smooth_update=smooth_update,
+            )
+        else:
+            print(f"  ERROR: Unknown FireANTs model: {model_name}")
+            return False
+        
+        # Run the registration
+        reg.fit(
+            fixed=fixed_fa,
+            moving=moving_fa,
+            fixed_mask=fixed_mask_fa,
+            moving_mask=moving_mask_fa,
+        )
+        
+        print("  FireANTs registration completed.")
+        
+        # =====================================================================
+        # Extract and save transforms
+        # =====================================================================
+        print("\n[Step 3] Saving registration outputs...")
+        
+        # Get warped moving image
+        warped_moving = reg.transform(moving_fa)
+        warped_moving.save(moving_warped_output)
+        print(f"  Warped moving image: {moving_warped_output}")
+        
+        # Get inverse warped fixed image
+        inv_warped_fixed = reg.inverse_transform(fixed_fa)
+        inv_warped_fixed.save(fixed_warped_output)
+        print(f"  Inverse warped fixed image: {fixed_warped_output}")
+        
+        # Save displacement fields
+        if hasattr(reg, 'get_warp'):
+            warp = reg.get_warp()
+            warp.save(warp_file)
+            print(f"  Forward warp: {warp_file}")
+        
+        if hasattr(reg, 'get_inverse_warp'):
+            inv_warp = reg.get_inverse_warp()
+            inv_warp.save(inv_warp_file)
+            print(f"  Inverse warp: {inv_warp_file}")
+        
+        # Save affine transform if applicable
+        if hasattr(reg, 'get_affine'):
+            affine_matrix = reg.get_affine()
+            # Save as ANTs-compatible .mat format
+            np.savetxt(affine_file, affine_matrix.cpu().numpy())
+            print(f"  Affine transform: {affine_file}")
+        
+        # =====================================================================
+        # Warp masks if available
+        # =====================================================================
+        moving_mask_warped_output = None
+        fixed_mask_warped_output = None
+        
+        if moving_mask_original:
+            print("\n[Step 4] Warping masks...")
+            moving_mask_warped_output = os.path.join(output_dir, f"{output_prefix}mask_warped{output_filetype}")
+            mov_mask_fa = FAImage.load(moving_mask_original)
+            warped_mask = reg.transform(mov_mask_fa, interpolation='nearest')
+            warped_mask.save(moving_mask_warped_output)
+            print(f"  Warped moving mask: {moving_mask_warped_output}")
+        
+        if fixed_mask_original:
+            fixed_mask_warped_output = os.path.join(output_dir, f"{output_prefix}mask_inv_warped{output_filetype}")
+            fix_mask_fa = FAImage.load(fixed_mask_original)
+            inv_warped_mask = reg.inverse_transform(fix_mask_fa, interpolation='nearest')
+            inv_warped_mask.save(fixed_mask_warped_output)
+            print(f"  Inverse warped fixed mask: {fixed_mask_warped_output}")
+        
+        # =====================================================================
+        # Registration accuracy metrics
+        # =====================================================================
+        if fixed_mask_original and moving_mask_original and moving_mask_warped_output:
+            print("\nComputing registration quality measures...")
+            metrics_output = os.path.join(output_dir, f"{output_prefix}0_reg_accuracy.csv")
+            try:
+                metrics = calculate_registration_accuracy(
+                    fixed_img_path=fixed,
+                    warped_moving_path=moving_warped_output,
+                    fixed_mask_path=fixed_mask_original,
+                    warped_moving_mask_path=moving_mask_warped_output,
+                    output_path=metrics_output
+                )
+                if 'Dice' in metrics and not np.isnan(metrics['Dice']):
+                    print(f"  Dice: {metrics['Dice']:.4f}")
+            except Exception as e:
+                print(f"  Failed to calculate registration metrics: {e}")
+        
+        print("\n" + "=" * 80)
+        print("FireANTs registration complete.")
+        print("=" * 80)
+        
+        return (warp_file, affine_file, moving_warped_output, fixed_warped_output,
+                moving_mask_warped_output, fixed_mask_warped_output)
+        
+    except Exception as e:
+        print(f"ERROR in FireANTs registration: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 #%% Run registration
 
@@ -1090,7 +1504,9 @@ DFs = prep_reg(
     reg_mask=reg_expand_mask,
     dimensions=dimensions,
     output_filetype=output_filetype,
-    mask_inputs=use_mask_inputs
+    mask_inputs=use_mask_inputs,
+    registration_runtime=registration_runtime,
+    fireants_args=args if registration_runtime == 'fireants' else None
 )
 
 print("Script execution complete.")
