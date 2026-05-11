@@ -1,10 +1,12 @@
 # =============================================================================
 # registration_config.yaml
 # =============================================================================
-# Configuration for Proton_py_Registration2-3.py
+# Configuration for py_Registration.py
+# 
+# Current values support high-resolution MRI & CT lung inspiraton to expiration registration.
 #
 # USAGE:
-#   python Proton_py_Registration2-3.py -yaml registration_config.yaml -pat_dir /path/to/patient
+#   python Proton_py_Registration3.py -yaml registration_config.yaml -pat_dir /path/to/patient
 #
 # When -yaml is used, only -pat_dir is required on the command line.
 # Any CLI flag still overrides the corresponding YAML value.
@@ -17,7 +19,7 @@
 # ---------------------------------------------------------------------------
 paths:
   # ANTs binary directory
-  ants_path: /usr/local/community/polaris/tools/ants/2.5.1/bin/
+  ants_path: /usr/local/community/polaris/tools/ants/2.5.1/bin/ # 
 
   # Scan folder name within patient/timepoint structure
   scan_folder: "img"                     # -scn_dir
@@ -47,8 +49,8 @@ options:
   # Registration dimensions
   dimensions: "3"                        # -dim
 
-  # Mask expansion radius for registration (0 = no expansion, default: 8)
-  reg_expand_mask: 8                     # -reg_exp_mask
+  # Mask expansion radius for registration (0 = no expansion, default: 4)
+  reg_expand_mask: 4                     # -reg_exp_mask
 
   # Output file type
   output_filetype: ".nii.gz"             # -out_type
@@ -57,14 +59,14 @@ options:
   save_input_copies: false               # -saveinputs
 
   # Apply masks to input images before registration
-  use_masked_inputs: false               # -masked_inputs
+  use_masked_inputs: true               # -masked_inputs
 
 
 # ---------------------------------------------------------------------------
 # REGISTRATION — Runtime and parameter settings
 # ---------------------------------------------------------------------------
 registration:
-  # Registration runtime: 'ants' (default) or 'fireants' (GPU)
+  # Registration runtime: 'ants' (default) NOTE: Other registration runtimes not yet supported.
   runtime: ants
 
   # =========================================================================
@@ -108,7 +110,7 @@ registration:
 
 
   # =========================================================================
-  # FireANTs parameters (only used when runtime: fireants)
+  # FireANTs parameters (only used when runtime: fireants) - NOT YET IMPLEMENTED!!!
   # =========================================================================
   # GPU-accelerated diffeomorphic registration via FireANTs
   # See: https://github.com/rohitrango/FireANTs
