@@ -16,10 +16,21 @@
 # POLARIS - University of Sheffield 
 
 mkdir -p qsuboutput/ #Make logging directory
+export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$NSLOTS #itk multi-threading
 
-# Dummy BASH script for image registration. 
-# -----------------------------------------
+# ==================================================================================================================
+# Image Registration Script
+# ==================================================================================================================
+# TWO MODES:
+#   1. YAML config (recommended): All stable settings in a .yaml file
+#   2. Full CLI (original): All settings as bash variables + command-line flags
 #
+# TWO RUNTIMES:
+#   - ants (default): CPU-based, ANTs subprocess (antsRegistration)
+#   - fireants: GPU-accelerated diffeomorphic registration (requires GPU node + FireANTs)
+# ==================================================================================================================
+
+
 # Directory structure should be:
 #		"DataFolder" / "PatientNumber" / "Visit" / "Image" & "Masks" / *.nii.gz or *.mha
 #		*Should* work with any image types, provided the masks and images are consistent.
@@ -61,11 +72,11 @@ mkdir -p qsuboutput/ #Make logging directory
 # 		pandas
 # 		argparse
 # 		pathlib
-# 		ants
-#		antspyx
+#		  antspyx
 # 		subprocess
 # 		scipy
 # 		skimage
+#     fireants (USE pip install) [NOTE: Not currently functional/Required]
 #
 # 5) Once installed you can type: > source deactivate    Which takes you out of the enviromnent, and > exit		to exit environment
 
@@ -85,57 +96,95 @@ itk=/usr/local/community/polaris/tools/itk 					#Path to ITK on Sharc (unused!)
 #
 # Set Patient directory
 dir=/shared/path/to/your/data/directory/with/each/patient	# Edit this to be the path to the directory of your patients you want to register images in. 										#<<-[EDIT]
+reg_script=/path/to/py_Registration.py              # <<-[EDIT]
+reg_config=/path/to/registration_config.yaml                  # <<-[EDIT]
+#
 #
 patient_id=`ls "$dir" | sed -n "$SGE_TASK_ID"p` 			# Read directory of patients, should be 1 folder per patient. Uses Job-array ($SGE_TASK_ID) number specified by -t flag above.
 patient_dir=$dir/$patient_id 								# Get Patient directory from patient ID. 
 #
-sdir=/pyRegistration.py # Registration Script 			# Change this to where the pyRegistration.py python file is stored 															#<<--[EDIT]
-#--------------------------------------
-# ANTS COMMAND CALL - Currently using a generic high-resolution multi-step (Rigid, Affine, Non-linear), multi-level (downsampled resolution -> full resolution) registration.
 
-# The placeholders {output_prefix_full_placeholder}, {fixed_placeholder}, and {moving_placeholder} will be replaced by the Python script with actual file paths
 
-#REGISTRATION DEFINITION
-AntsRegCmd=""
-AntsRegCmd+="--dimensionality 3 "                                                                                          											# Change if using 2D Images
-AntsRegCmd+="--verbose 1 "                                                                                                 											# Enable verbosity
-AntsRegCmd+="--output \"{output_prefix_full_placeholder}\" " 																										# Handles output for raw transform files
-AntsRegCmd+="--use-histogram-matching 1 "                                                                                  											# Histogram Matching
-AntsRegCmd+="--initial-moving-transform \"[{fixed_placeholder},{moving_placeholder},1]\" "                                 											# Initial Transform step
+cho "Running Patient: $patient_id"
+echo "=========================="
 
-# ====== First registration step - RIGID ======
-AntsRegCmd+="{nomasks} "
-AntsRegCmd+="--transform \"Rigid[0.1]\" "
-AntsRegCmd+="--metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" "
-AntsRegCmd+="--convergence \"1000x500x250x100\" "
-AntsRegCmd+="--smoothing-sigmas \"3x2x1x0\" "
-AntsRegCmd+="--shrink-factors \"8x4x2x1\" "
+# ==================================================================================================================
+# RECOMMENDED: YAML config mode
+# ==================================================================================================================
+# Everything (paths, ANTs command, masks, FireANTs params) is in the YAML.
+# Only patient directory changes per job.
 
-# ====== Second registration step - AFFINE ======
-AntsRegCmd+="{addmasks} "
-AntsRegCmd+="--transform \"Affine[0.1]\" "
-AntsRegCmd+="--metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" "
-AntsRegCmd+="--convergence \"1000x500x250x100\" "
-AntsRegCmd+="--smoothing-sigmas \"3x2x1x0\" "
-AntsRegCmd+="--shrink-factors \"8x4x2x1\" "
+python $reg_script \
+    -yaml $reg_config \
+    -pat_dir $patient_dir
 
-# ====== Third registration step - DEFORMABLE (BSplineSyN) ======
-AntsRegCmd+="{addmasks} "
-AntsRegCmd+="--transform \"BSplineSyN[0.2,65,0,3]\" "
-AntsRegCmd+="--metric \"CC[{fixed_placeholder},{moving_placeholder},1,2]\" "
-AntsRegCmd+="--convergence \"500x200x70x50x10\" "
-AntsRegCmd+="--smoothing-sigmas \"5x3x2x1x0\" "
-AntsRegCmd+="--shrink-factors \"10x6x4x2x1\""
 
-#AntsRegCmd+="{addmasks} " #If you want to globally define masks to use for all steps, remove other lines with masks and uncomment this.
+# ==================================================================================================================
+# YAML + per-run overrides
+# ==================================================================================================================
 
-#--------------------------------------
-# RUN PYTHON SCRIPT - Python call
-python $sdir -pat_dir $patient_dir -scn_dir "Image_Folder" -seg_dir "Mask_Folder" -f "FixedImageName" -m "MovingImageName" -f_mask "EXPIRATION" -m_mask "INSPIRATION" -ants_path $ap -ants_reg_params "$AntsRegCmd" -saveinputs -masked_inputs																			#<<-[EDIT]
+# # Use FireANTs GPU registration (request GPU node with: #$ -l gpu=1) #NOT YET IMPLEMENTED!
+# python $reg_script \
+#     -yaml $reg_config \
+#     -pat_dir $patient_dir \
+#     -runtime fireants
+
+# # Override image identifiers
+# python $reg_script \
+#     -yaml $reg_config \
+#     -pat_dir $patient_dir \
+#     -f "_FRC" -m "_TLC"
+
+
+# ==================================================================================================================
+# ALTERNATIVE: Full CLI mode (no YAML needed, backward compatible)
+# ==================================================================================================================
+
+# ap=/usr/local/community/polaris/tools/ants/2.5.1/bin/
 #
+# AntsRegCmd=""
+# AntsRegCmd+="--dimensionality 3 "
+# AntsRegCmd+="--verbose 1 "
+# AntsRegCmd+="--output \"{output_prefix_full_placeholder}\" "
+# AntsRegCmd+="--use-histogram-matching 1 "
+# AntsRegCmd+="--initial-moving-transform \"[{fixed_placeholder},{moving_placeholder},1]\" "
+# AntsRegCmd+="{nomasks} "
+# AntsRegCmd+="--transform \"Rigid[0.1]\" "
+# AntsRegCmd+="--metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.25]\" "
+# AntsRegCmd+="--convergence \"1000x500x250x100\" "
+# AntsRegCmd+="--smoothing-sigmas \"3x2x1x0\" "
+# AntsRegCmd+="--shrink-factors \"8x4x2x1\" "
+# AntsRegCmd+="{nomasks} "
+# AntsRegCmd+="--transform \"Affine[0.1]\" "
+# AntsRegCmd+="--metric \"MI[{fixed_placeholder},{moving_placeholder},1,32,Regular,0.75]\" "
+# AntsRegCmd+="--convergence \"1000x500x250x100\" "
+# AntsRegCmd+="--smoothing-sigmas \"3x2x1x0\" "
+# AntsRegCmd+="--shrink-factors \"8x4x2x1\" "
+# AntsRegCmd+="{addmasks} "
+# AntsRegCmd+="--transform \"BSplineSyN[0.2,65,0,3]\" "
+# AntsRegCmd+="--metric \"CC[{fixed_placeholder},{moving_placeholder},1,2]\" "
+# AntsRegCmd+="--convergence \"500x200x70x50x10\" "
+# AntsRegCmd+="--smoothing-sigmas \"5x3x2x1x0\" "
+# AntsRegCmd+="--shrink-factors \"10x6x4x2x1\""
+#
+# python $reg_script \
+#     -pat_dir $patient_dir \
+#     -scn_dir "img" -seg_dir "seg" \
+#     -f "_RV" -m "_TLC" \
+#     -f_mask "EXPIRATION" -m_mask "INSPIRATION" \
+#     -ants_path $ap \
+#     -ants_reg_params "$AntsRegCmd" \
+#     -saveinputs -masked_inputs
+
+
+echo "=========================================="
+echo "Completed processing for patient $patient_id"
+echo "=========================================="
+
+
 
 ################################################################################
-# PYTHON SCRIPT PARAMETERS REFERENCE
+# PYTHON SCRIPT PARAMETERS REFERENCE - for CLI
 ################################################################################
 #
 # REQUIRED:
