@@ -8,6 +8,9 @@ Need nested structure of patient image folders:
 	
 *Should* work with any image types, provided the masks and images are consistent filetypes.
 
+# Input
+Supports either CLI, or YAML file input for registration paramaters.
+
 # Output
 Outputs registrations to folder: "Reg_{moving image name}_2_{fixed image name}" in Patient folder:
 
