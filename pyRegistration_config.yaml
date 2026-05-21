@@ -46,6 +46,18 @@ options:
   img_fix_mask: null                     # -f_mask
   img_mov_mask: null                     # -m_mask
 
+  # Ignore-substring filters (null = none).
+  # A file containing ANY of these substrings is skipped when searching for
+  # the corresponding image/mask, even if it also contains the identifier.
+  # Useful for excluding reproducibility / extra scans that share an identifier.
+  # Accepts a YAML list, e.g.  img_fix_ignore: ["extra", "repro"]
+  img_fix_ignore: null                   # -f_i       (fixed image)
+  img_mov_ignore: null                   # -m_i       (moving image)
+  img_fix_mask_ignore: null              # -f_mask_i  (fixed mask)
+  img_mov_mask_ignore: null              # -m_mask_i  (moving mask)
+  # Global ignore list applied automatically to ALL four searches above.
+  img_ignore_all: null                   # -i
+
   # Registration dimensions
   dimensions: "3"                        # -dim
 
