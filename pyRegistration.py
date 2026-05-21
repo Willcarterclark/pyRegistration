@@ -146,6 +146,29 @@ def parse_arguments():
                         default=yaml_options.get('img_fix_mask', None))
     parser.add_argument('-m_mask', '--img_mov_mask', help="Mask Moving image identifier", type=str,
                         default=yaml_options.get('img_mov_mask', None))
+
+    # -------------------------------------------------------------------------
+    # Ignore-substring filters: a file that contains any of these substrings is
+    # skipped when searching for the corresponding image/mask, even if it also
+    # contains the matching identifier. Each accepts one or more space-separated
+    # values. -i is a global list automatically applied to ALL four searches.
+    # -------------------------------------------------------------------------
+    parser.add_argument('-f_i', '--img_fix_ignore', nargs='+', type=str,
+                        help="Substring(s) to ignore when matching the fixed image",
+                        default=yaml_options.get('img_fix_ignore', None))
+    parser.add_argument('-m_i', '--img_mov_ignore', nargs='+', type=str,
+                        help="Substring(s) to ignore when matching the moving image",
+                        default=yaml_options.get('img_mov_ignore', None))
+    parser.add_argument('-f_mask_i', '--img_fix_mask_ignore', nargs='+', type=str,
+                        help="Substring(s) to ignore when matching the fixed mask",
+                        default=yaml_options.get('img_fix_mask_ignore', None))
+    parser.add_argument('-m_mask_i', '--img_mov_mask_ignore', nargs='+', type=str,
+                        help="Substring(s) to ignore when matching the moving mask",
+                        default=yaml_options.get('img_mov_mask_ignore', None))
+    parser.add_argument('-i', '--img_ignore_all', nargs='+', type=str,
+                        help="Substring(s) ignored globally for ALL image/mask searches",
+                        default=yaml_options.get('img_ignore_all', None))
+
     parser.add_argument('-sub_dir', '--sub_folder', type=str,
                         default=yaml_paths.get('sub_folder', None))
     parser.add_argument('-dim','--dimensions', help="Registration Dimensions", type=str,
@@ -253,6 +276,30 @@ save_input_copies = args.save_input_copies
 use_mask_inputs = args.use_masked_inputs if args.use_masked_inputs else None
 registration_runtime = args.registration_runtime
 
+# --- Ignore-substring filters --------------------------------------------------
+def _as_ignore_list(value):
+    """Normalise an ignore spec (None / str / list) into a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value]
+
+def _merge_ignores(specific, global_list):
+    """Combine a specific ignore list with the global list, de-duplicated, order-preserving."""
+    out = []
+    for item in list(specific) + list(global_list):
+        if item and item not in out:
+            out.append(item)
+    return out
+
+# Global ignore list (-i) is folded into every per-image/per-mask list
+_ignore_global   = _as_ignore_list(args.img_ignore_all)
+img_fix_ignore       = _merge_ignores(_as_ignore_list(args.img_fix_ignore),       _ignore_global)
+img_mov_ignore       = _merge_ignores(_as_ignore_list(args.img_mov_ignore),       _ignore_global)
+img_fix_mask_ignore  = _merge_ignores(_as_ignore_list(args.img_fix_mask_ignore),  _ignore_global)
+img_mov_mask_ignore  = _merge_ignores(_as_ignore_list(args.img_mov_mask_ignore),  _ignore_global)
+
 # Ensure output filetype starts with a dot
 if not output_filetype.startswith('.'):
     output_filetype = '.' + output_filetype
@@ -264,6 +311,11 @@ print(f"Segmentation Folder: {seg_folder}")
 print(f"Path to ANTs binaries: {path_ants}")
 print(f"Fixed Image Identifier: {img_fix}")
 print(f"Moving Image Identifier: {img_mov}")
+print(f"Global Ignore Terms (-i): {_ignore_global if _ignore_global else 'None'}")
+print(f"Fixed Image Ignore Terms: {img_fix_ignore if img_fix_ignore else 'None'}")
+print(f"Moving Image Ignore Terms: {img_mov_ignore if img_mov_ignore else 'None'}")
+print(f"Fixed Mask Ignore Terms: {img_fix_mask_ignore if img_fix_mask_ignore else 'None'}")
+print(f"Moving Mask Ignore Terms: {img_mov_mask_ignore if img_mov_mask_ignore else 'None'}")
 print(f"Registration Dimensions: {dimensions}")
 print(f"ANTs Registration Parameters String: {ants_reg_params_str}")
 print(f"Output Directory: {output_directory if output_directory else 'In-folder (default)'}")
@@ -520,10 +572,29 @@ def save_sitk(image, output_path):
     print(f"Saving sitk file to: {output_path}")
     return sitk.WriteImage(image, str(output_path))
 
-def find_match(array, search_string):
-    """Find string in array containing search_string"""
+def find_match(array, search_string, ignore=None):
+    """
+    Find the first string in 'array' that contains 'search_string'.
+
+    Args:
+        array:         Iterable of candidate filename strings.
+        search_string: Substring that must be present for a match.
+        ignore:        Optional list of substrings. Any candidate that
+                       contains one or more of these is skipped, even if
+                       it also contains 'search_string'. Lets you exclude
+                       e.g. reproducibility/extra scans that share the same
+                       identifier.
+
+    Returns:
+        The first matching filename, or None if nothing matches.
+    """
+    ignore = ignore or []
     for string in array:
         if search_string in string:
+            skipped = [ig for ig in ignore if ig in string]
+            if skipped:
+                print(f"  Ignoring '{string}' (matched ignore term(s): {skipped})")
+                continue
             return string
     return None
 
@@ -712,7 +783,9 @@ def format_command_string(cmd_string):
 def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8, 
              ants_reg_params_str=None, output_base_dir=None, Fixed_mask=None, 
              Moving_mask=None, dimensions="3", output_filetype='.nii.gz', mask_inputs=False,
-             registration_runtime='ants', fireants_args=None):
+             registration_runtime='ants', fireants_args=None,
+             Fixed_ignore=None, Moving_ignore=None,
+             Fixed_mask_ignore=None, Moving_mask_ignore=None):
     
     
     global fix_img_path
@@ -733,6 +806,10 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
         output_base_dir: Optional output directory
         Fixed_mask: Optional fixed mask identifier
         Moving_mask: Optional moving mask identifier
+        Fixed_ignore: Substrings to skip when matching the fixed image
+        Moving_ignore: Substrings to skip when matching the moving image
+        Fixed_mask_ignore: Substrings to skip when matching the fixed mask
+        Moving_mask_ignore: Substrings to skip when matching the moving mask
         dimensions: Registration dimensions (default "3")
         output_filetype: Output file extension (default '.nii.gz')
     """
@@ -767,22 +844,22 @@ def prep_reg(Input_imgs, Fixed_img, Moving_img, Input_segs=None, reg_mask=8,
             seg_dir = None
         
         # Find the fixed and moving images
-        fix_img = find_match(imgs, Fixed_img)
-        mov_img = find_match(imgs, Moving_img)
+        fix_img = find_match(imgs, Fixed_img, ignore=Fixed_ignore)
+        mov_img = find_match(imgs, Moving_img, ignore=Moving_ignore)
         
         # Find the fixed and moving segmentations if available
         if has_segs and segs is not None:
             # Fixed Mask
             if Fixed_mask:
-                fix_seg = find_match(segs, Fixed_mask)
+                fix_seg = find_match(segs, Fixed_mask, ignore=Fixed_mask_ignore)
             else:
-                fix_seg = find_match(segs, Fixed_img)
+                fix_seg = find_match(segs, Fixed_img, ignore=Fixed_mask_ignore)
             
             # Moving Mask
             if Moving_mask:
-                mov_seg = find_match(segs, Moving_mask)
+                mov_seg = find_match(segs, Moving_mask, ignore=Moving_mask_ignore)
             else:
-                mov_seg = find_match(segs, Moving_img)
+                mov_seg = find_match(segs, Moving_img, ignore=Moving_mask_ignore)
         else:
             fix_seg = None
             mov_seg = None
@@ -1501,6 +1578,10 @@ DFs = prep_reg(
     output_base_dir=output_directory,
     Fixed_mask=img_fix_mask,
     Moving_mask=img_mov_mask,
+    Fixed_ignore=img_fix_ignore,
+    Moving_ignore=img_mov_ignore,
+    Fixed_mask_ignore=img_fix_mask_ignore,
+    Moving_mask_ignore=img_mov_mask_ignore,
     reg_mask=reg_expand_mask,
     dimensions=dimensions,
     output_filetype=output_filetype,
