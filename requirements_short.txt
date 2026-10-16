@@ -19,4 +19,4 @@ tqdm==4.67.1
 typing==3.7.4.3
 typing_extensions==4.12.2
 webcolors==24.11.1
-fireants=1.5.0 
+fireants==1.5.0 
